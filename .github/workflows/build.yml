@@ -1,0 +1,3728 @@
+name: Build APK
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v5
+        with:
+          gradle-version: 8.7
+      - name: Generate project files
+        run: |
+          set -e
+          mkdir -p project && cd project
+          mkdir -p "$(dirname 'app/build.gradle.kts')"
+          cat > 'app/build.gradle.kts' <<'RZX_EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.rizzxy.store"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.rizzxy.store"
+                  minSdk = 28
+                  targetSdk = 34
+                  versionCode = 3
+                  versionName = "1.2"
+              }
+              buildTypes {
+                  release { isMinifyEnabled = false }
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+              packaging {
+                  resources {
+                      excludes += setOf(
+                          "META-INF/versions/**",
+                          "META-INF/maven/**",
+                          "META-INF/proguard/**",
+                          "META-INF/DEPENDENCIES",
+                          "META-INF/{AL2.0,LGPL2.1}"
+                      )
+                  }
+              }
+          }
+
+          dependencies {
+              // ADB nirkabel (pairing + koneksi TLS ke adbd di perangkat ini)
+              implementation("com.github.MuntashirAkon:libadb-android:3.1.1")
+              implementation("org.conscrypt:conscrypt-android:2.5.3")
+              // membuat sertifikat X.509 untuk kunci ADB
+              implementation("org.bouncycastle:bcpkix-jdk15to18:1.81")
+          }
+
+          // hindari kelas BouncyCastle ganda (keluarga jdk15to18 saja)
+          configurations.all {
+              exclude(group = "org.bouncycastle", module = "bcprov-jdk18on")
+              exclude(group = "org.bouncycastle", module = "bcpkix-jdk18on")
+              exclude(group = "org.bouncycastle", module = "bcutil-jdk18on")
+          }
+          RZX_EOF
+          mkdir -p "$(dirname 'app/src/main/AndroidManifest.xml')"
+          cat > 'app/src/main/AndroidManifest.xml' <<'RZX_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+              <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+              <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+              <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.KILL_BACKGROUND_PROCESSES" />
+              <uses-permission android:name="android.permission.WRITE_SECURE_SETTINGS" />
+
+              <application
+                  android:allowBackup="false"
+                  android:icon="@mipmap/ic_launcher"
+                  android:roundIcon="@mipmap/ic_launcher"
+                  android:label="Rizzxy Store"
+                  android:theme="@style/AppTheme">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".RunService"
+                      android:exported="false"
+                      android:foregroundServiceType="specialUse">
+                      <property
+                          android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                          android:value="Membuka server game bergantian dengan jeda waktu" />
+                  </service>
+
+                  <service
+                      android:name=".AutoService"
+                      android:exported="false"
+                      android:label="Rizzxy Store"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.accessibilityservice"
+                          android:resource="@xml/accessibility_service" />
+                  </service>
+
+                  <receiver
+                      android:name=".PairReceiver"
+                      android:exported="false" />
+
+                  <receiver
+                      android:name=".AdminReceiver"
+                      android:exported="true"
+                      android:permission="android.permission.BIND_DEVICE_ADMIN">
+                      <meta-data
+                          android:name="android.app.device_admin"
+                          android:resource="@xml/device_admin" />
+                      <intent-filter>
+                          <action android:name="android.app.action.DEVICE_ADMIN_ENABLED" />
+                      </intent-filter>
+                  </receiver>
+              </application>
+          </manifest>
+          RZX_EOF
+          mkdir -p "$(dirname 'app/src/main/java/com/rizzxy/store/AdbHelper.kt')"
+          cat > 'app/src/main/java/com/rizzxy/store/AdbHelper.kt' <<'RZX_EOF'
+          package com.rizzxy.store
+
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.PendingIntent
+          import android.app.RemoteInput
+          import android.content.Context
+          import android.content.Intent
+          import android.graphics.drawable.Icon
+          import android.net.nsd.NsdManager
+          import android.net.nsd.NsdServiceInfo
+          import android.os.Build
+          import io.github.muntashirakon.adb.AbsAdbConnectionManager
+          import org.bouncycastle.asn1.x500.X500Name
+          import org.bouncycastle.cert.jcajce.JcaX509CertificateConverter
+          import org.bouncycastle.cert.jcajce.JcaX509v3CertificateBuilder
+          import org.bouncycastle.operator.jcajce.JcaContentSignerBuilder
+          import java.io.ByteArrayInputStream
+          import java.io.File
+          import java.math.BigInteger
+          import java.net.Inet4Address
+          import java.net.NetworkInterface
+          import java.security.KeyFactory
+          import java.security.KeyPairGenerator
+          import java.security.PrivateKey
+          import java.security.cert.Certificate
+          import java.security.cert.CertificateFactory
+          import java.security.spec.PKCS8EncodedKeySpec
+          import java.util.Collections
+          import java.util.Date
+          import java.util.concurrent.CountDownLatch
+          import java.util.concurrent.TimeUnit
+
+          /**
+           * ADB nirkabel di perangkat ini sendiri (Wireless Debugging, Android 11+):
+           * pairing dengan kode 6 digit, connect, lalu jalankan perintah shell (mis. dpm set-device-owner).
+           */
+          object AdbHelper {
+
+              const val PAIR_TYPE = "_adb-tls-pairing._tcp"
+              const val CONNECT_TYPE = "_adb-tls-connect._tcp"
+
+              @Volatile
+              var connected = false
+                  private set
+
+              // hasil deteksi otomatis (mDNS)
+              @Volatile
+              var pairPort = 0
+              @Volatile
+              var connPort = 0
+
+              /** Dipanggil tiap ada log / port baru (bisa dari thread mana pun). */
+              @Volatile
+              var onChange: (() -> Unit)? = null
+
+              private val logs = ArrayList<String>()
+              private var mgr: Mgr? = null
+              private var discovery: Discovery? = null
+
+              // ===== log =====
+
+              fun log(s: String) {
+                  synchronized(logs) {
+                      logs.add(s)
+                      while (logs.size > 60) logs.removeAt(0)
+                  }
+                  onChange?.invoke()
+              }
+
+              fun logText(): String = synchronized(logs) { logs.joinToString("\n") }
+
+              // ===== manajer koneksi + kunci yang disimpan =====
+
+              private class Mgr(ctx: Context) : AbsAdbConnectionManager() {
+                  private val priv: PrivateKey
+                  private val cert: Certificate
+
+                  init {
+                      setApi(Build.VERSION.SDK_INT)
+                      val kf = File(ctx.filesDir, "adb_key.der")
+                      val cf = File(ctx.filesDir, "adb_cert.der")
+                      var p: PrivateKey? = null
+                      var c: Certificate? = null
+                      try {
+                          if (kf.exists() && cf.exists()) {
+                              p = KeyFactory.getInstance("RSA").generatePrivate(PKCS8EncodedKeySpec(kf.readBytes()))
+                              c = CertificateFactory.getInstance("X.509").generateCertificate(ByteArrayInputStream(cf.readBytes()))
+                          }
+                      } catch (e: Exception) {
+                          p = null
+                          c = null
+                      }
+                      if (p == null || c == null) {
+                          val gen = KeyPairGenerator.getInstance("RSA")
+                          gen.initialize(2048)
+                          val kp = gen.generateKeyPair()
+                          val name = X500Name("CN=RizzxyStore")
+                          val now = System.currentTimeMillis()
+                          val holder = JcaX509v3CertificateBuilder(
+                              name,
+                              BigInteger.valueOf(now),
+                              Date(now - 86400000L),
+                              Date(now + 3650L * 86400000L),
+                              name,
+                              kp.public
+                          ).build(JcaContentSignerBuilder("SHA256withRSA").build(kp.private))
+                          val x509 = JcaX509CertificateConverter().getCertificate(holder)
+                          kf.writeBytes(kp.private.encoded)
+                          cf.writeBytes(x509.encoded)
+                          p = kp.private
+                          c = x509
+                      }
+                      priv = p!!
+                      cert = c!!
+                  }
+
+                  override fun getPrivateKey(): PrivateKey = priv
+                  override fun getCertificate(): Certificate = cert
+                  override fun getDeviceName(): String = "RizzxyStore"
+              }
+
+              @Synchronized
+              private fun m(ctx: Context): Mgr {
+                  var x = mgr
+                  if (x == null) {
+                      x = Mgr(ctx.applicationContext)
+                      mgr = x
+                  }
+                  return x
+              }
+
+              // ===== alamat =====
+
+              /** IP Wi-Fi perangkat ini (alamat yang didengarkan Wireless Debugging). */
+              fun localIp(): String {
+                  try {
+                      val all = NetworkInterface.getNetworkInterfaces() ?: return "127.0.0.1"
+                      for (ni in Collections.list(all)) {
+                          if (!ni.isUp || ni.isLoopback) continue
+                          for (a in Collections.list(ni.inetAddresses)) {
+                              if (a is Inet4Address && a.isSiteLocalAddress) {
+                                  val h = a.hostAddress
+                                  if (h != null) return h
+                              }
+                          }
+                      }
+                  } catch (_: Exception) {
+                  }
+                  return "127.0.0.1"
+              }
+
+              // ===== operasi =====
+
+              @Synchronized
+              fun pair(ctx: Context, host: String, port: Int, code: String) {
+                  val r: Any? = m(ctx).pair(host, port, code)
+                  if (r == false) throw IllegalStateException("Pairing ditolak (kode salah atau sudah kedaluwarsa)")
+              }
+
+              @Synchronized
+              fun connect(ctx: Context, host: String, port: Int) {
+                  val r: Any? = m(ctx).connect(host, port)
+                  if (r == false) throw IllegalStateException("Gagal terhubung ke $host:$port")
+                  connected = true
+              }
+
+              private fun waitPort(initial: Int, get: () -> Int, what: String): Int {
+                  var p = if (initial > 0) initial else get()
+                  var waited = 0
+                  while (p <= 0 && waited < 8000) {
+                      Thread.sleep(250)
+                      waited += 250
+                      p = get()
+                  }
+                  if (p <= 0) throw IllegalStateException("Port $what tidak ditemukan. Pastikan Debugging nirkabel aktif.")
+                  return p
+              }
+
+              /** Pairing lalu langsung connect. Port yang 0 diambil dari deteksi otomatis. */
+              fun pairAndConnect(ctx: Context, code: String, hostIn: String, pairPortIn: Int, connPortIn: Int) {
+                  val host = if (hostIn.isBlank()) localIp() else hostIn
+                  val pp = waitPort(pairPortIn, { pairPort }, "pairing (buka dialog 'Pair device with pairing code')")
+                  log("PAIR $host:$pp")
+                  pair(ctx, host, pp, code)
+                  log("Pairing berhasil")
+                  pairPort = 0
+                  connectAuto(ctx, host, connPortIn)
+              }
+
+              fun connectAuto(ctx: Context, hostIn: String, connPortIn: Int) {
+                  val host = if (hostIn.isBlank()) localIp() else hostIn
+                  val cp = waitPort(connPortIn, { connPort }, "connect")
+                  log("CONNECT $host:$cp")
+                  connect(ctx, host, cp)
+                  log("Terhubung ke adbd")
+              }
+
+              /** Jalankan satu perintah shell lewat ADB, kembalikan outputnya. */
+              fun run(ctx: Context, cmd: String): String {
+                  val st = m(ctx).openStream("shell:$cmd")
+                  try {
+                      return st.openInputStream().bufferedReader().readText()
+                  } catch (e: Exception) {
+                      connected = false
+                      throw e
+                  } finally {
+                      try { st.close() } catch (_: Exception) {}
+                  }
+              }
+
+              fun disconnect() {
+                  try { mgr?.disconnect() } catch (_: Exception) {}
+                  connected = false
+              }
+
+              // ===== deteksi port otomatis (mDNS) =====
+
+              @Synchronized
+              fun startDiscovery(ctx: Context) {
+                  if (discovery != null) return
+                  discovery = Discovery(ctx.applicationContext).also { it.start() }
+                  log("Mendeteksi port Wireless Debugging…")
+              }
+
+              @Synchronized
+              fun stopDiscovery() {
+                  discovery?.stop()
+                  discovery = null
+              }
+
+              private class Discovery(ctx: Context) {
+                  private val nsd = ctx.getSystemService(Context.NSD_SERVICE) as NsdManager
+                  private val listeners = ArrayList<NsdManager.DiscoveryListener>()
+                  private val lock = Any()
+
+                  fun start() {
+                      for (t in listOf(PAIR_TYPE, CONNECT_TYPE)) {
+                          val l = object : NsdManager.DiscoveryListener {
+                              override fun onDiscoveryStarted(serviceType: String) {}
+                              override fun onServiceFound(info: NsdServiceInfo) { resolve(t, info) }
+                              override fun onServiceLost(info: NsdServiceInfo) {
+                                  if (t == PAIR_TYPE) pairPort = 0 else connPort = 0
+                                  onChange?.invoke()
+                              }
+                              override fun onDiscoveryStopped(serviceType: String) {}
+                              override fun onStartDiscoveryFailed(serviceType: String, errorCode: Int) {}
+                              override fun onStopDiscoveryFailed(serviceType: String, errorCode: Int) {}
+                          }
+                          listeners.add(l)
+                          try {
+                              nsd.discoverServices(t, NsdManager.PROTOCOL_DNS_SD, l)
+                          } catch (_: Exception) {
+                          }
+                      }
+                  }
+
+                  fun stop() {
+                      for (l in listeners) {
+                          try { nsd.stopServiceDiscovery(l) } catch (_: Exception) {}
+                      }
+                      listeners.clear()
+                  }
+
+                  // resolveService hanya boleh satu per satu, jadi diserialkan dan diulang bila sibuk
+                  private fun resolve(t: String, info: NsdServiceInfo) {
+                      Thread {
+                          for (n in 0 until 8) {
+                              val done = CountDownLatch(1)
+                              var ok = false
+                              synchronized(lock) {
+                                  try {
+                                      nsd.resolveService(info, object : NsdManager.ResolveListener {
+                                          override fun onResolveFailed(i: NsdServiceInfo, errorCode: Int) { done.countDown() }
+                                          override fun onServiceResolved(i: NsdServiceInfo) {
+                                              ok = true
+                                              if (t == PAIR_TYPE) pairPort = i.port else connPort = i.port
+                                              log((if (t == PAIR_TYPE) "Port pairing: " else "Port connect: ") + i.port)
+                                              done.countDown()
+                                          }
+                                      })
+                                      done.await(3, TimeUnit.SECONDS)
+                                  } catch (_: Exception) {
+                                  }
+                              }
+                              if (ok) return@Thread
+                              Thread.sleep(500)
+                          }
+                      }.start()
+                  }
+              }
+
+              // ===== pairing lewat notifikasi (dialog pairing Android tetap terbuka) =====
+
+              fun postPairNotification(ctx: Context) {
+                  val nm = ctx.getSystemService(NotificationManager::class.java)
+                  nm.createNotificationChannel(NotificationChannel("pair", "Pairing ADB", NotificationManager.IMPORTANCE_HIGH))
+                  val ri = RemoteInput.Builder("code").setLabel("Kode pairing 6 digit").build()
+                  val flags = PendingIntent.FLAG_UPDATE_CURRENT or (if (Build.VERSION.SDK_INT >= 31) PendingIntent.FLAG_MUTABLE else 0)
+                  val pi = PendingIntent.getBroadcast(ctx, 7, Intent(ctx, PairReceiver::class.java), flags)
+                  val act = Notification.Action.Builder(
+                      Icon.createWithResource(ctx, android.R.drawable.ic_menu_edit), "Ketik kode", pi
+                  ).addRemoteInput(ri).build()
+                  val n = Notification.Builder(ctx, "pair")
+                      .setSmallIcon(android.R.drawable.ic_menu_manage)
+                      .setContentTitle("Pairing ADB")
+                      .setContentText("Buka 'Pair device with pairing code', lalu ketik kodenya di sini")
+                      .addAction(act)
+                      .setOngoing(true)
+                      .build()
+                  nm.notify(2, n)
+              }
+
+              fun postStatus(ctx: Context, text: String) {
+                  val nm = ctx.getSystemService(NotificationManager::class.java)
+                  nm.createNotificationChannel(NotificationChannel("pair", "Pairing ADB", NotificationManager.IMPORTANCE_HIGH))
+                  val n = Notification.Builder(ctx, "pair")
+                      .setSmallIcon(android.R.drawable.ic_menu_manage)
+                      .setContentTitle("Pairing ADB")
+                      .setContentText(text)
+                      .setAutoCancel(true)
+                      .build()
+                  nm.notify(2, n)
+              }
+          }
+          RZX_EOF
+          mkdir -p "$(dirname 'app/src/main/java/com/rizzxy/store/AdminReceiver.kt')"
+          cat > 'app/src/main/java/com/rizzxy/store/AdminReceiver.kt' <<'RZX_EOF'
+          package com.rizzxy.store
+
+          import android.app.admin.DeviceAdminReceiver
+
+          class AdminReceiver : DeviceAdminReceiver()
+          RZX_EOF
+          mkdir -p "$(dirname 'app/src/main/java/com/rizzxy/store/AutoService.kt')"
+          cat > 'app/src/main/java/com/rizzxy/store/AutoService.kt' <<'RZX_EOF'
+          package com.rizzxy.store
+
+          import android.accessibilityservice.AccessibilityService
+          import android.accessibilityservice.GestureDescription
+          import android.content.Intent
+          import android.graphics.Path
+          import android.view.accessibility.AccessibilityEvent
+
+          /** Menekan Home secara global dan mengetuk titik layar (untuk fitur nickname otomatis). Tidak membaca isi layar. */
+          class AutoService : AccessibilityService() {
+
+              companion object {
+                  @Volatile
+                  var instance: AutoService? = null
+
+                  fun home(): Boolean =
+                      instance?.performGlobalAction(AccessibilityService.GLOBAL_ACTION_HOME) ?: false
+
+                  fun ready(): Boolean = instance != null
+
+                  /** Cadangan kalau Aksesibilitas mati tapi HP root: ketuk lewat `input`. */
+                  private fun tapRoot(x: Float, y: Float, durMs: Long): Boolean {
+                      if (RootHelper.rooted != true) return false
+                      return try {
+                          val xi = x.toInt(); val yi = y.toInt()
+                          if (durMs > 120) RootHelper.run("input swipe $xi $yi $xi $yi $durMs", 15)
+                          else RootHelper.run("input tap $xi $yi", 15)
+                          true
+                      } catch (e: Exception) {
+                          false
+                      }
+                  }
+
+                  /** Ketuk (atau tahan selama durMs) titik x,y dalam piksel layar. */
+                  fun tap(x: Float, y: Float, durMs: Long): Boolean {
+                      val svc = instance
+                      if (svc == null) return tapRoot(x, y, durMs)
+                      return try {
+                          val path = Path()
+                          path.moveTo(x, y)
+                          val stroke = GestureDescription.StrokeDescription(path, 0L, durMs)
+                          val g = GestureDescription.Builder().addStroke(stroke).build()
+                          svc.dispatchGesture(g, null, null)
+                      } catch (e: Exception) {
+                          false
+                      }
+                  }
+              }
+
+              override fun onServiceConnected() {
+                  instance = this
+              }
+
+              override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
+
+              override fun onInterrupt() {}
+
+              override fun onUnbind(intent: Intent?): Boolean {
+                  instance = null
+                  return super.onUnbind(intent)
+              }
+          }
+          RZX_EOF
+          mkdir -p "$(dirname 'app/src/main/java/com/rizzxy/store/Cfg.kt')"
+          cat > 'app/src/main/java/com/rizzxy/store/Cfg.kt' <<'RZX_EOF'
+          package com.rizzxy.store
+
+          import android.content.Context
+
+          /** Pengaturan paket + waktu, disimpan di dalam APK (bisa diubah dari menu PENGATURAN). */
+          object Cfg {
+              // GANTI nomor owner di sini (format internasional tanpa +, contoh 6281234567890)
+              const val OWNER_NUMBER = "62XXXXXXXXXXX"
+
+              const val DEF_ACT = "com.moba.unityplugin.MobaGameMainActivityWithExtractor"
+              const val DEF_COUNT = 5
+              const val DEF_D1 = 15
+              const val DEF_D2 = 10
+              const val GIFT_COUNT = 10
+              const val GIFT_D1 = 3
+              const val GIFT_D2 = 0
+              const val GIFT_ACT = "com.moba.unityplugin.MobaGameMainMainActivity"
+
+              // prefix, suffix, extras
+              private val defaults = mapOf(
+                  "normal" to arrayOf("RizzxyStore", "", "RizzxyStore.merge"),
+                  "advance" to arrayOf("com.advance.serve", "0,1,2,3,4,5,6,7,8,9,t,u,v,w,x,y,z", ""),
+                  "gift" to arrayOf("com.advance.serve", "0,1,2,3,4,5,6,7,8,9,t,u,v,w,x,y,z", "")
+              )
+
+              // ===== NICKNAME OTOMATIS (hanya RUN 2) =====
+              // mode: 0 OFF, 1 RANDOM (ketuk-ketuk), 2 REQUEST (nick sendiri, di-paste)
+              // Alur per baris:  @x,y = ketuk | @x,y*N = ketuk N kali | !x,y = tahan | ~S = tunggu S detik | # = catatan
+              const val DEF_NICK_TEXT = "STOK-RIZZXY-"
+              const val DEF_NICK_START = 1
+              const val DEF_NICK_PRE = 2
+              const val DEF_NICK_GAP_MS = 800
+              const val DEF_NICK_AFTER = 3
+              const val DEF_NICK_FLOW = "# CONTOH, atur titiknya pakai CARI TITIK\n@0.50,0.50\n~1\n!0.50,0.50\n~1\n@0.55,0.40\n~1\n@0.60,0.80\n~2\n@0.90,0.10"
+              const val DEF_NICK_RFLOW = "# CONTOH, ketuk titik tengah 10 kali\n@0.50,0.50*10"
+
+              fun nickMode(c: Context): Int = sp(c).getInt("nick.mode", 0)
+              fun setNickMode(c: Context, v: Int) = sp(c).edit().putInt("nick.mode", v).apply()
+              fun nickText(c: Context): String {
+                  val p = sp(c)
+                  // migrasi sekali: awalan lama "Ats-" -> STOK-RIZZXY-
+                  if (!p.getBoolean("nick.text.v2", false)) {
+                      if (p.getString("nick.text", null).equals("Ats-", true)) p.edit().putString("nick.text", DEF_NICK_TEXT).apply()
+                      p.edit().putBoolean("nick.text.v2", true).apply()
+                  }
+                  return p.getString("nick.text", DEF_NICK_TEXT) ?: DEF_NICK_TEXT
+              }
+              fun setNickText(c: Context, v: String) = sp(c).edit().putString("nick.text", v.trim()).apply()
+              fun nickStart(c: Context): Int {
+                  val p = sp(c)
+                  // migrasi sekali: nilai lama 101 -> 001
+                  if (!p.getBoolean("nick.start.v2", false)) {
+                      if (p.getInt("nick.start", DEF_NICK_START) == 101) p.edit().putInt("nick.start", DEF_NICK_START).apply()
+                      p.edit().putBoolean("nick.start.v2", true).apply()
+                  }
+                  return p.getInt("nick.start", DEF_NICK_START)
+              }
+              fun setNickStart(c: Context, v: Int) = sp(c).edit().putInt("nick.start", v).apply()
+              fun nickPre(c: Context): Int = sp(c).getInt("nick.pre", DEF_NICK_PRE)
+              fun setNickPre(c: Context, v: Int) = sp(c).edit().putInt("nick.pre", v).apply()
+              fun nickGapMs(c: Context): Int = sp(c).getInt("nick.gap", DEF_NICK_GAP_MS)
+              fun setNickGapMs(c: Context, v: Int) = sp(c).edit().putInt("nick.gap", v).apply()
+              fun nickAfter(c: Context): Int = sp(c).getInt("nick.after", DEF_NICK_AFTER)
+              fun setNickAfter(c: Context, v: Int) = sp(c).edit().putInt("nick.after", v).apply()
+              fun nickFlow(c: Context): String = sp(c).getString("nick.flow", DEF_NICK_FLOW) ?: DEF_NICK_FLOW
+              fun setNickFlow(c: Context, v: String) = sp(c).edit().putString("nick.flow", v.trim()).apply()
+              fun nickRFlow(c: Context): String = sp(c).getString("nick.rflow", DEF_NICK_RFLOW) ?: DEF_NICK_RFLOW
+              fun setNickRFlow(c: Context, v: String) = sp(c).edit().putString("nick.rflow", v.trim()).apply()
+
+              private fun sp(c: Context) = c.getSharedPreferences("cfg", Context.MODE_PRIVATE)
+
+              fun get(c: Context, type: String, field: String): String {
+                  val d = defaults[type] ?: arrayOf("", "", "")
+                  val def = when (field) {
+                      "prefix" -> d[0]
+                      "suffix" -> d[1]
+                      "extras" -> d[2]
+                      else -> if (type == "gift") GIFT_ACT else DEF_ACT
+                  }
+                  return sp(c).getString("$type.$field", def) ?: def
+              }
+
+              fun set(c: Context, type: String, field: String, v: String) {
+                  sp(c).edit().putString("$type.$field", v.trim()).apply()
+              }
+
+              fun getInt(c: Context, key: String, def: Int): Int = sp(c).getInt(key, def)
+
+              fun setInt(c: Context, key: String, v: Int) {
+                  sp(c).edit().putInt(key, v).apply()
+              }
+
+              fun reset(c: Context) {
+                  sp(c).edit().clear().apply()
+              }
+
+              /**
+               * Daftar paket satu jenis server.
+               * - akhiran diisi  -> awalan + tiap akhiran (urutan sesuai tulisan)
+               * - akhiran kosong -> semua paket terpasang yang diawali awalan
+               * Lalu ditambah paket tambahan.
+               */
+              fun packages(c: Context, type: String, installed: List<String>): List<String> {
+                  val prefix = get(c, type, "prefix")
+                  val suffixes = get(c, type, "suffix").split(",").map { it.trim() }.filter { it.isNotEmpty() }
+                  val extras = get(c, type, "extras").split(",", "\n", " ").map { it.trim() }.filter { it.isNotEmpty() }
+                  val base: List<String> = when {
+                      prefix.isEmpty() -> emptyList()
+                      suffixes.isEmpty() -> installed.filter { it.startsWith(prefix) }.sorted()
+                      else -> suffixes.map { prefix + it }
+                  }
+                  return (base + extras).distinct()
+              }
+          }
+          RZX_EOF
+          mkdir -p "$(dirname 'app/src/main/java/com/rizzxy/store/Lock.kt')"
+          cat > 'app/src/main/java/com/rizzxy/store/Lock.kt' <<'RZX_EOF'
+          package com.rizzxy.store
+
+          import android.content.Context
+          import android.provider.Settings
+          import org.json.JSONObject
+          import java.net.HttpURLConnection
+          import java.net.URL
+          import java.security.MessageDigest
+
+          /**
+           * Kunci akses online: token diperiksa ke server (Vercel "rizky-database").
+           * Token diatur lewat halaman admin: kedaluwarsa, batas perangkat, nonaktifkan, dll.
+           * Status aktif disimpan di data app; app memeriksa ulang ke server secara berkala.
+           */
+          object Lock {
+              /** Alamat server token. Ganti kalau domain proyek Vercel-mu berbeda. */
+              const val API_BASE = "https://rizky-database.vercel.app"
+
+              /** Boleh offline maksimal 72 jam sejak verifikasi sukses terakhir. */
+              private const val GRACE_MS = 72L * 3600_000L
+
+              /** Periksa ulang ke server paling sering tiap 5 menit. */
+              private const val RECHECK_MS = 5L * 60_000L
+
+              /** net = true berarti gagal karena jaringan/server (bukan penolakan token). */
+              class Result(val ok: Boolean, val exp: Long = 0L, val reason: String = "", val net: Boolean = false)
+
+              private fun sp(c: Context) = c.getSharedPreferences("lock", Context.MODE_PRIVATE)
+
+              /** Waktu efektif: jam HP tidak bisa dimundurkan untuk memperpanjang token. */
+              private fun nowMs(c: Context): Long {
+                  val p = sp(c)
+                  val last = p.getLong("seen", 0L)
+                  val eff = maxOf(System.currentTimeMillis(), last)
+                  if (eff > last) p.edit().putLong("seen", eff).apply()
+                  return eff
+              }
+
+              /** ID perangkat (dipakai server untuk membatasi jumlah HP per token). */
+              fun deviceId(c: Context): String {
+                  val raw = Settings.Secure.getString(c.contentResolver, Settings.Secure.ANDROID_ID) ?: "x"
+                  val h = MessageDigest.getInstance("SHA-256").digest(("RZX|" + raw).toByteArray())
+                  val hex = h.joinToString("") { "%02X".format(it) }
+                  return hex.substring(0, 4) + "-" + hex.substring(4, 8)
+              }
+
+              /** Periksa token ke server. Panggil dari thread background. */
+              fun verify(c: Context, token: String): Result {
+                  return try {
+                      val con = URL(API_BASE + "/api?op=verify").openConnection() as HttpURLConnection
+                      con.requestMethod = "POST"
+                      con.connectTimeout = 10000
+                      con.readTimeout = 15000
+                      con.doOutput = true
+                      con.setRequestProperty("Content-Type", "application/json")
+                      val body = JSONObject().put("token", token).put("device", deviceId(c)).toString()
+                      con.outputStream.use { it.write(body.toByteArray()) }
+                      val code = con.responseCode
+                      val stream = if (code in 200..299) con.inputStream else con.errorStream
+                      val text = stream?.bufferedReader()?.use { it.readText() } ?: ""
+                      con.disconnect()
+                      val j = try { JSONObject(text) } catch (e: Exception) { null }
+                      if (j == null) {
+                          Result(false, reason = "Server tidak merespons dengan benar ($code)", net = true)
+                      } else if (j.optBoolean("ok")) {
+                          Result(true, j.optLong("exp", 0L))
+                      } else {
+                          Result(false, reason = j.optString("reason", "Token ditolak"), net = j.optBoolean("temp", false))
+                      }
+                  } catch (e: Exception) {
+                      Result(false, reason = "Tidak bisa terhubung ke server. Periksa internet.", net = true)
+                  }
+              }
+
+              private fun lockOut(p: android.content.SharedPreferences, note: String) {
+                  p.edit().putBoolean("ok", false).putString("note", note).apply()
+              }
+
+              fun isUnlocked(c: Context): Boolean {
+                  val p = sp(c)
+                  if (!p.getBoolean("v4", false)) {
+                      // buang status dari skema lama (token offline)
+                      p.edit().putBoolean("v4", true).putBoolean("ok", false).apply()
+                  }
+                  if (!p.getBoolean("ok", false)) return false
+                  val now = nowMs(c)
+                  val exp = p.getLong("exp", 0L)
+                  if (exp > 0L && now > exp) {
+                      lockOut(p, "Token kedaluwarsa, masukkan token baru.")
+                      return false
+                  }
+                  if (now - p.getLong("lastOk", 0L) > GRACE_MS) {
+                      lockOut(p, "Terlalu lama offline. Sambungkan internet lalu masukkan token lagi.")
+                      return false
+                  }
+                  return true
+              }
+
+              /** Simpan token yang sudah terverifikasi. */
+              fun save(c: Context, token: String, exp: Long) {
+                  val now = nowMs(c)
+                  sp(c).edit()
+                      .putBoolean("ok", true)
+                      .putString("token", token.trim())
+                      .putLong("exp", exp)
+                      .putLong("lastOk", now)
+                      .putLong("checked", now)
+                      .remove("note")
+                      .apply()
+              }
+
+              /** Pesan alasan terkunci (sekali pakai), atau string kosong. */
+              fun takeNote(c: Context): String {
+                  val p = sp(c)
+                  val n = p.getString("note", "") ?: ""
+                  if (n.isNotEmpty()) p.edit().remove("note").apply()
+                  return n
+              }
+
+              /**
+               * Periksa ulang token di server (maks tiap 5 menit). Kalau server menolak
+               * (dinonaktifkan / kedaluwarsa / dihapus), kunci lagi dan panggil onLocked.
+               * Gagal jaringan tidak mengunci app (ada toleransi offline 72 jam).
+               */
+              fun revalidate(c: Context, onLocked: () -> Unit) {
+                  val p = sp(c)
+                  if (!p.getBoolean("ok", false)) return
+                  val now = nowMs(c)
+                  if (now - p.getLong("checked", 0L) < RECHECK_MS) return
+                  p.edit().putLong("checked", now).apply()
+                  val token = p.getString("token", "") ?: ""
+                  Thread {
+                      val r = verify(c, token)
+                      if (r.ok) {
+                          sp(c).edit().putLong("exp", r.exp).putLong("lastOk", nowMs(c)).apply()
+                      } else if (!r.net) {
+                          lockOut(sp(c), r.reason)
+                          onLocked()
+                      }
+                  }.start()
+              }
+          }
+          RZX_EOF
+          mkdir -p "$(dirname 'app/src/main/java/com/rizzxy/store/MainActivity.kt')"
+          cat > 'app/src/main/java/com/rizzxy/store/MainActivity.kt' <<'RZX_EOF'
+          package com.rizzxy.store
+
+          import android.Manifest
+          import android.app.Activity
+          import android.app.ActivityManager
+          import android.app.AlertDialog
+          import android.app.admin.DevicePolicyManager
+          import android.content.ComponentName
+          import android.content.Intent
+          import android.content.pm.ApplicationInfo
+          import android.content.pm.PackageManager
+          import android.graphics.Color
+          import android.graphics.Typeface
+          import android.graphics.drawable.ColorDrawable
+          import android.graphics.drawable.GradientDrawable
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.text.InputType
+          import android.text.Editable
+          import android.text.TextWatcher
+          import android.view.Gravity
+          import android.view.View
+          import android.view.ViewGroup
+          import android.widget.BaseAdapter
+          import android.widget.Button
+          import android.widget.CheckBox
+          import android.widget.FrameLayout
+          import java.io.File
+          import java.util.concurrent.Callable
+          import android.widget.EditText
+          import android.widget.ImageView
+          import android.widget.LinearLayout
+          import android.widget.ListView
+          import android.widget.ScrollView
+          import android.widget.TextView
+          import android.widget.Toast
+          import java.util.concurrent.Executors
+
+          class MainActivity : Activity() {
+
+              private val googlePkgs = listOf(
+                  "com.google.android.gms",
+                  "com.android.vending",
+                  "com.google.android.gsf"
+              )
+
+              // palet warna (neon gelap)
+              private val cyan get() = Theme.t(0xFFA855F7.toInt())
+              private val green get() = Theme.t(0xFFC084FC.toInt())
+              private val bg get() = Theme.t(0xFF0B0714.toInt())
+              private val card get() = Theme.s(0xFF1A1030.toInt())
+              private val cardDark get() = Theme.s(0xFF130B24.toInt())
+              private val line get() = Theme.t(0xFF4C2A7A.toInt())
+              private val muted get() = Theme.t(0xFFA59BC4.toInt())
+              private val white get() = Theme.t(0xFFEDE9FE.toInt())
+              private val red = 0xFFEF4444.toInt()
+              private val btnBg get() = Theme.t(0xFF3B1A66.toInt())
+              private val btnLine get() = Theme.t(0xFF6D3FB5.toInt())
+
+              data class AppRow(val pkg: String, val label: String, val system: Boolean)
+
+              private lateinit var dpm: DevicePolicyManager
+              private lateinit var admin: ComponentName
+              private var all = listOf<AppRow>()
+              private var installedSet = setOf<String>()
+              private var tab = 0          // 0 NORMAL, 1 ADVANCE, 2 DATA, 3 ADB, 4 GIFT
+              private var filter = 0       // 0 ALL, 1 USER, 2 SYSTEM
+              private var query = ""
+              private val selected = linkedSetOf<String>()
+              private val selSrv = mapOf("normal" to linkedSetOf<String>(), "advance" to linkedSetOf<String>(), "gift" to linkedSetOf<String>())
+              private var serverItems = listOf<AppRow>()
+
+              private val tabBtns = mutableListOf<Button>()
+              private val filterBtns = mutableListOf<Button>()
+              private lateinit var banner: TextView
+              private lateinit var serverPane: LinearLayout
+              private lateinit var dataPane: LinearLayout
+              private lateinit var resetBtn: Button
+              private lateinit var dataAdapter: RowAdapter
+              private lateinit var srvAdapter: ServerAdapter
+              private lateinit var srvTitle: TextView
+              private lateinit var autoSub: TextView
+              private lateinit var adbPane: ScrollView
+              private lateinit var adbIp: EditText
+              private lateinit var adbPairPort: EditText
+              private lateinit var adbCode: EditText
+              private lateinit var adbConnPort: EditText
+              private lateinit var adbStatus: TextView
+              private lateinit var adbGroup: LinearLayout
+              private lateinit var rootGroup: LinearLayout
+              private val modeBtns = mutableListOf<Button>()
+              private lateinit var adbLog: TextView
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  Theme.load(this)
+                  window.statusBarColor = Theme.t(0xFF0B0714.toInt())
+                  window.navigationBarColor = Theme.t(0xFF0B0714.toInt())
+                  dpm = getSystemService(DevicePolicyManager::class.java)
+                  admin = ComponentName(this, AdminReceiver::class.java)
+                  val ui = buildUi()
+                  setContentView(ui)
+                  if (!Lock.isUnlocked(this)) {
+                      ui.visibility = View.INVISIBLE
+                      showLock(ui)
+                  } else {
+                      Lock.revalidate(this) { runOnUiThread { recreate() } }
+                  }
+                  if (Build.VERSION.SDK_INT >= 33 &&
+                      checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+                  ) {
+                      requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
+                  }
+                  AdbHelper.onChange = { runOnUiThread { adbSync() } }
+                  refresh()
+                  // daftar aplikasi dimuat di belakang layar supaya halaman utama langsung tampil
+                  loadAppsAsync { refresh() }
+              }
+
+              private var lockShown = false
+
+              private fun showLock(ui: View) {
+                  lockShown = true
+                  val et = field("TOKEN", false)
+                  et.inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+                  val wrap = LinearLayout(this).apply {
+                      setPadding(dp(20), dp(8), dp(20), 0)
+                      addView(et, LinearLayout.LayoutParams(-1, -2))
+                  }
+                  val note = Lock.takeNote(this)
+                  val d = AlertDialog.Builder(this)
+                      .setTitle("RIZZXY STORE")
+                      .setMessage("Masukkan token akses (butuh internet). Cukup sekali selama token masih berlaku." +
+                          (if (note.isNotEmpty()) "\n\n" + note else ""))
+                      .setView(wrap)
+                      .setCancelable(false)
+                      .setPositiveButton("MASUK", null)
+                      .setNegativeButton("KELUAR") { _, _ -> finish() }
+                      .create()
+                  d.show()
+                  val btn = d.getButton(AlertDialog.BUTTON_POSITIVE)
+                  btn.setOnClickListener {
+                      val token = et.text.toString().trim()
+                      if (token.isEmpty()) {
+                          et.error = "Isi token dulu"
+                      } else {
+                          btn.isEnabled = false
+                          btn.text = "MEMERIKSA…"
+                          Thread {
+                              val r = Lock.verify(this, token)
+                              runOnUiThread {
+                                  btn.isEnabled = true
+                                  btn.text = "MASUK"
+                                  if (r.ok) {
+                                      Lock.save(this, token, r.exp)
+                                      lockShown = false
+                                      ui.visibility = View.VISIBLE
+                                      d.dismiss()
+                                  } else {
+                                      et.setText("")
+                                      et.error = r.reason
+                                  }
+                              }
+                          }.start()
+                      }
+                  }
+              }
+
+              override fun onDestroy() {
+                  AdbHelper.onChange = null
+                  videoBg?.release()
+                  videoBg = null
+                  super.onDestroy()
+              }
+
+              override fun onPause() {
+                  videoBg?.pausePlayback()
+                  super.onPause()
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  if (!lockShown && !Lock.isUnlocked(this)) {
+                      recreate()
+                      return
+                  }
+                  if (!lockShown) Lock.revalidate(this) { runOnUiThread { recreate() } }
+                  videoBg?.resumePlayback()
+                  if (::banner.isInitialized) refresh()
+              }
+
+              /**
+               * Pindai aplikasi terpasang di thread background. Nama aplikasi disimpan di cache
+               * (labels.tsv, dikunci waktu ubah APK) sehingga pembukaan berikutnya jauh lebih cepat;
+               * nama yang belum ada di cache dibaca paralel.
+               */
+              private fun loadAppsAsync(after: () -> Unit) {
+                  Thread {
+                      val rows = scanApps()
+                      runOnUiThread {
+                          all = rows
+                          installedSet = rows.map { it.pkg }.toSet()
+                          after()
+                      }
+                  }.start()
+              }
+
+              private fun scanApps(): List<AppRow> {
+                  val pm = packageManager
+                  val cacheFile = File(filesDir, "labels.tsv")
+                  val cache = HashMap<String, Pair<Long, String>>()
+                  try {
+                      if (cacheFile.exists()) cacheFile.forEachLine { ln ->
+                          val p = ln.split('\t', limit = 3)
+                          if (p.size == 3) cache[p[0]] = (p[1].toLongOrNull() ?: 0L) to p[2]
+                      }
+                  } catch (_: Exception) {
+                  }
+                  val infos = pm.getInstalledApplications(0)
+                  val labels = HashMap<String, String>()
+                  val stamps = HashMap<String, Long>()
+                  val todo = ArrayList<ApplicationInfo>()
+                  for (ai in infos) {
+                      val stamp = try { File(ai.sourceDir).lastModified() } catch (_: Exception) { 0L }
+                      stamps[ai.packageName] = stamp
+                      val c = cache[ai.packageName]
+                      if (c != null && c.first == stamp) labels[ai.packageName] = c.second else todo.add(ai)
+                  }
+                  if (todo.isNotEmpty()) {
+                      val pool = Executors.newFixedThreadPool(4)
+                      try {
+                          val jobs = todo.map { ai ->
+                              Callable {
+                                  ai.packageName to (try { ai.loadLabel(pm).toString() } catch (_: Exception) { ai.packageName })
+                              }
+                          }
+                          for (f in pool.invokeAll(jobs)) {
+                              try {
+                                  val r = f.get()
+                                  labels[r.first] = r.second
+                              } catch (_: Exception) {
+                              }
+                          }
+                      } finally {
+                          pool.shutdown()
+                      }
+                      try {
+                          cacheFile.writeText(infos.joinToString("\n") { ai ->
+                              val l = (labels[ai.packageName] ?: ai.packageName).replace('\t', ' ').replace('\n', ' ')
+                              ai.packageName + "\t" + (stamps[ai.packageName] ?: 0L) + "\t" + l
+                          })
+                      } catch (_: Exception) {
+                      }
+                  }
+                  return infos
+                      .map {
+                          AppRow(it.packageName, labels[it.packageName] ?: it.packageName,
+                              it.flags and ApplicationInfo.FLAG_SYSTEM != 0)
+                      }
+                      .sortedBy { it.label.lowercase() }
+              }
+
+              private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+              private fun type() = when (tab) { 0 -> "normal"; 4 -> "gift"; else -> "advance" }
+
+              private fun fmt(s: Int): String = when {
+                  s <= 0 -> "OFF"
+                  s >= 60 && s % 60 == 0 -> "${s / 60}m"
+                  else -> "${s}s"
+              }
+
+              // ===== helper tampilan =====
+
+              private fun shape(color: Int, radius: Int, strokeDp: Int = 0, strokeColor: Int = 0) = GradientDrawable().apply {
+                  cornerRadius = dp(radius).toFloat()
+                  setColor(color)
+                  if (strokeDp > 0) setStroke(dp(strokeDp), strokeColor)
+              }
+
+              private fun tv(t: String, size: Float, color: Int, bold: Boolean = false) = TextView(this).apply {
+                  text = t
+                  textSize = size
+                  setTextColor(color)
+                  if (bold) typeface = Typeface.DEFAULT_BOLD
+              }
+
+              private fun pill(b: Button, active: Boolean) {
+                  b.background = shape(if (active) Theme.t(0xFF4C1D95.toInt()) else cardDark, 14, 1, if (active) cyan else Theme.t(0xFF24173D.toInt()))
+                  b.setTextColor(if (active) cyan else muted)
+              }
+
+              private fun mkBtn(text: String, onClick: () -> Unit): Button = Button(this).apply {
+                  this.text = text
+                  textSize = 12f
+                  typeface = Typeface.DEFAULT_BOLD
+                  stateListAnimator = null
+                  minHeight = dp(40)
+                  minimumHeight = dp(40)
+                  setOnClickListener { onClick() }
+              }
+
+              private fun colorBtn(text: String, color: Int, onClick: () -> Unit): Button {
+                  val b = mkBtn(text, onClick)
+                  b.setTextColor(0xFFFFFFFF.toInt())
+                  b.background = shape(color, 14)
+                  return b
+              }
+
+              private fun iconBtn(glyph: String, color: Int, onClick: () -> Unit) = tv(glyph, 22f, color, true).apply {
+                  gravity = Gravity.CENTER
+                  setPadding(dp(10), dp(6), dp(10), dp(6))
+                  setOnClickListener { onClick() }
+              }
+
+              /** Tombol kecil bergaya "OPEN"/"START". */
+              private fun softBtn(text: String, onClick: () -> Unit) = tv(text, 12f, green, true).apply {
+                  gravity = Gravity.CENTER
+                  setPadding(dp(16), dp(11), dp(16), dp(11))
+                  background = shape(btnBg, 12, 1, btnLine)
+                  setOnClickListener { onClick() }
+              }
+
+              private fun styleChip(v: TextView, active: Boolean) {
+                  v.background = shape(if (active) cyan else cardDark, 10)
+                  v.setTextColor(if (active) Theme.t(0xFF1E0B3A.toInt()) else white)
+              }
+
+              private fun chip(t: String, onClick: () -> Unit) = TextView(this).apply {
+                  text = t
+                  gravity = Gravity.CENTER
+                  textSize = 11f
+                  typeface = Typeface.DEFAULT_BOLD
+                  setOnClickListener { onClick() }
+              }
+
+              private fun stepBtn(t: String, onClick: () -> Unit) = tv(t, 22f, cyan, true).apply {
+                  gravity = Gravity.CENTER
+                  background = shape(Theme.t(0xFF3B1A66.toInt()), 12, 1, cyan)
+                  setOnClickListener { onClick() }
+              }
+
+              // ===== susunan layar =====
+
+              private fun buildUi(): View {
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setBackgroundColor(if (Theme.hasWall) Color.TRANSPARENT else bg)
+                      setPadding(dp(12), dp(36), dp(12), dp(12))
+                  }
+
+                  // kartu header: logo + judul + refresh + pengaturan, lalu tab
+                  val headCard = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      background = shape(card, 20, 1, line)
+                      setPadding(dp(12), dp(12), dp(12), dp(12))
+                  }
+                  val titleRow = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      gravity = Gravity.CENTER_VERTICAL
+                      setPadding(dp(2), 0, dp(2), dp(10))
+                  }
+                  val logo = ImageView(this).apply {
+                      setImageResource(R.mipmap.ic_launcher)
+                      scaleType = ImageView.ScaleType.CENTER_CROP
+                      outlineProvider = object : android.view.ViewOutlineProvider() {
+                          override fun getOutline(v: View, o: android.graphics.Outline) {
+                              o.setRoundRect(0, 0, v.width, v.height, dp(10).toFloat())
+                          }
+                      }
+                      clipToOutline = true
+                  }
+                  titleRow.addView(logo, LinearLayout.LayoutParams(dp(36), dp(36)))
+                  val title = tv("RIZZXY STORE", 14f, white, true).apply {
+                      letterSpacing = 0.08f
+                      setOnLongClickListener { confirmReleaseOwner(); true }
+                  }
+                  titleRow.addView(title, LinearLayout.LayoutParams(0, -2, 1f).apply { leftMargin = dp(10) })
+                  titleRow.addView(iconBtn("↻", cyan) {
+                      loadAppsAsync { refresh(); toast("Daftar aplikasi dimuat ulang") }
+                  })
+                  if (Theme.hasVideo) {
+                      val snd = ImageView(this).apply {
+                          setImageResource(if (Theme.muted) R.drawable.ic_vol_off else R.drawable.ic_vol_on)
+                          setColorFilter(green)
+                          scaleType = ImageView.ScaleType.CENTER
+                      }
+                      snd.setOnClickListener {
+                          toggleMute()
+                          snd.setImageResource(if (Theme.muted) R.drawable.ic_vol_off else R.drawable.ic_vol_on)
+                      }
+                      titleRow.addView(snd, LinearLayout.LayoutParams(dp(44), dp(36)))
+                  }
+                  titleRow.addView(iconBtn("◐", green) { openTheme() })
+                  titleRow.addView(iconBtn("⚙\uFE0E", green) { openSettings() })
+                  headCard.addView(titleRow)
+
+                  val tabRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+                  listOf("NORMAL", "ADVANCE", "DATA", "ADB/ROOT").forEachIndexed { i, name ->
+                      val b = mkBtn(name) { tab = i; refresh() }
+                      b.textSize = 11f
+                      b.setPadding(0, 0, 0, 0)
+                      tabBtns += b
+                      tabRow.addView(b, LinearLayout.LayoutParams(0, dp(46), 1f).apply {
+                          setMargins(dp(3), 0, dp(3), 0)
+                      })
+                  }
+                  headCard.addView(tabRow)
+                  root.addView(headCard)
+
+                  banner = TextView(this).apply {
+                      setTextColor(red); textSize = 11f
+                      setPadding(dp(4), dp(8), dp(4), dp(4))
+                  }
+                  root.addView(banner)
+
+                  // ===== panel SERVER (NORMAL / ADVANCE) =====
+                  serverPane = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+
+                  val head = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      gravity = Gravity.CENTER_VERTICAL
+                  }
+                  srvTitle = tv("", 12f, cyan, true)
+                  head.addView(srvTitle, LinearLayout.LayoutParams(0, -2, 1f))
+                  val allBtn = mkBtn("SEMUA") { selectAllServers(true) }
+                  val noneBtn = mkBtn("KOSONG") { selectAllServers(false) }
+                  pill(allBtn, false); pill(noneBtn, false)
+                  head.addView(allBtn)
+                  head.addView(noneBtn)
+                  serverPane.addView(head, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(10) })
+
+                  srvAdapter = ServerAdapter()
+                  val srvList = ListView(this)
+                  srvList.adapter = srvAdapter
+                  srvList.divider = null
+                  srvList.selector = ColorDrawable(Color.TRANSPARENT)
+                  srvList.overScrollMode = View.OVER_SCROLL_NEVER
+                  serverPane.addView(srvList, LinearLayout.LayoutParams(-1, 0, 1f))
+
+                  // kartu AUTO TASK
+                  val autoCard = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      gravity = Gravity.CENTER_VERTICAL
+                      background = shape(card, 16, 1, line)
+                      setPadding(dp(12), dp(12), dp(12), dp(12))
+                      setOnClickListener { openAuto() }
+                  }
+                  val autoIcon = tv("⇅", 20f, cyan, true).apply {
+                      gravity = Gravity.CENTER
+                      background = shape(cardDark, 12, 1, line)
+                  }
+                  autoCard.addView(autoIcon, LinearLayout.LayoutParams(dp(44), dp(44)))
+                  val autoTexts = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+                  autoTexts.addView(tv("AUTO TASK SEQUENCE", 13f, white, true).apply { setSingleLine() })
+                  autoSub = tv("", 10f, muted).apply { setSingleLine() }
+                  autoTexts.addView(autoSub)
+                  autoCard.addView(autoTexts, LinearLayout.LayoutParams(0, -2, 1f).apply {
+                      leftMargin = dp(12); rightMargin = dp(8)
+                  })
+                  autoCard.addView(softBtn("▶ START") { startRun() })
+                  serverPane.addView(autoCard, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) })
+
+                  serverPane.addView(colorBtn("CLOSE APK", 0xFF7F1D1D.toInt()) { closeRun() },
+                      LinearLayout.LayoutParams(-1, dp(46)).apply { topMargin = dp(8) })
+
+                  root.addView(serverPane, LinearLayout.LayoutParams(-1, 0, 1f))
+
+                  // ===== panel DATA =====
+                  dataPane = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+
+                  val fRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+                  listOf("ALL", "USER", "SYSTEM").forEachIndexed { i, name ->
+                      val b = mkBtn(name) { filter = i; refresh() }
+                      filterBtns += b
+                      fRow.addView(b, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
+                          setMargins(dp(3), dp(8), dp(3), dp(4))
+                      })
+                  }
+                  dataPane.addView(fRow)
+
+                  dataPane.addView(EditText(this).apply {
+                      hint = "SEARCH APP NAME OR PACKAGE..."
+                      setHintTextColor(muted); setTextColor(white); textSize = 12f
+                      setSingleLine()
+                      background = shape(card, 12, 1, line)
+                      setPadding(dp(12), dp(8), dp(12), dp(8))
+                      addTextChangedListener(object : TextWatcher {
+                          override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
+                          override fun onTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
+                          override fun afterTextChanged(s: Editable?) {
+                              query = s?.toString().orEmpty(); dataAdapter.notifyDataSetChanged()
+                          }
+                      })
+                  }, LinearLayout.LayoutParams(-1, -2).apply { setMargins(dp(3), dp(4), dp(3), dp(6)) })
+
+                  fun pinned(text: String, pick: () -> List<String>) {
+                      val b = mkBtn(text) {
+                          val p = pick()
+                          if (p.isEmpty()) toast("Tidak ada paket yang cocok")
+                          else { selected.addAll(p); refresh() }
+                      }
+                      b.gravity = Gravity.START or Gravity.CENTER_VERTICAL
+                      b.setPadding(dp(14), 0, dp(14), 0)
+                      pill(b, false)
+                      dataPane.addView(b, LinearLayout.LayoutParams(-1, -2).apply { setMargins(dp(3), dp(3), dp(3), dp(3)) })
+                  }
+                  pinned("CLEAR ALL NORMAL BRANCHES") { serversOf("normal") }
+                  pinned("CLEAR ALL ADVANCE BRANCHES") { serversOf("advance") }
+                  pinned("GOOGLE SERVICES (GMS + PLAY STORE)") { googlePkgs.filter { it in installedSet } }
+
+                  dataAdapter = RowAdapter({ visible() }, { selected.contains(it) }) { p ->
+                      if (!selected.add(p)) selected.remove(p)
+                      refresh()
+                  }
+                  val dataList = ListView(this)
+                  dataList.adapter = dataAdapter
+                  dataList.divider = null
+                  dataPane.addView(dataList, LinearLayout.LayoutParams(-1, 0, 1f))
+
+                  resetBtn = mkBtn("") { openConsole() }
+                  resetBtn.setTextColor(0xFFFFFFFF.toInt())
+                  resetBtn.background = shape(0xFFB91C1C.toInt(), 14)
+                  dataPane.addView(resetBtn, LinearLayout.LayoutParams(-1, dp(48)).apply { topMargin = dp(8) })
+
+                  root.addView(dataPane, LinearLayout.LayoutParams(-1, 0, 1f))
+
+                  adbPane = buildAdbPane()
+                  root.addView(adbPane, LinearLayout.LayoutParams(-1, 0, 1f))
+
+                  // kredit owner (selalu tampil di bagian bawah)
+                  val credit = tv("APK INI MILIK RIZZXY — JANGAN DIJUAL BELIKAN!!!\nOwner: wa.me/${Cfg.OWNER_NUMBER}\nContributor: Yiaa Sann", 10f, muted, true).apply {
+                      gravity = Gravity.CENTER
+                      setPadding(dp(4), dp(8), dp(4), 0)
+                  }
+                  root.addView(credit, LinearLayout.LayoutParams(-1, -2))
+                  return withWallpaper(root)
+              }
+
+              // ===== tema custom: warna + wallpaper =====
+
+              private var videoBg: VideoBg? = null
+
+              private fun withWallpaper(content: View): View {
+                  val vf = Theme.videoFile(this)
+                  val wp = Theme.wallpaper
+                  if (wp == null && !(Theme.hasVideo && vf.exists())) return content
+                  val fl = FrameLayout(this)
+                  fl.setBackgroundColor(bg)
+                  if (wp == null) {
+                      val v = VideoBg(this, vf, Theme.muted)
+                      videoBg = v
+                      fl.addView(v, FrameLayout.LayoutParams(-1, -1))
+                  } else {
+                      fl.addView(ImageView(this).apply {
+                          setImageBitmap(wp)
+                          scaleType = ImageView.ScaleType.CENTER_CROP
+                      }, FrameLayout.LayoutParams(-1, -1))
+                  }
+                  fl.addView(View(this).apply { setBackgroundColor(Theme.dimColor()) }, FrameLayout.LayoutParams(-1, -1))
+                  fl.addView(content, FrameLayout.LayoutParams(-1, -1))
+                  return fl
+              }
+
+              private val REQ_WALL = 77
+
+              private fun toggleMute() {
+                  Theme.setMuted(this, !Theme.muted)
+                  videoBg?.isMuted = Theme.muted
+                  toast(if (Theme.muted) "Suara video: MUTE" else "Suara video: UNMUTE")
+              }
+
+              private fun openTheme() {
+                  val box = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(dp(16), dp(12), dp(16), dp(4))
+                  }
+                  lateinit var dlg: AlertDialog
+                  fun label(t: String) = box.addView(tv(t, 11f, muted, true).apply { setPadding(0, dp(10), 0, dp(6)) })
+                  fun applyHue(h: Float) { Theme.setHue(this, h); dlg.dismiss(); recreate() }
+
+                  label("WARNA TEMA")
+                  val rows = Theme.presets.chunked(4)
+                  for (row in rows) {
+                      val lr = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+                      for ((name, h) in row) {
+                          val col = android.graphics.Color.HSVToColor(floatArrayOf(h, 0.62f, 0.95f))
+                          val chip = tv(name, 11f, 0xFF10101A.toInt(), true).apply {
+                              gravity = Gravity.CENTER
+                              background = shape(col, 12, if (Math.abs(Theme.hue - h) < 1f) 2 else 0, 0xFFFFFFFF.toInt())
+                              setOnClickListener { applyHue(h) }
+                          }
+                          lr.addView(chip, LinearLayout.LayoutParams(0, dp(42), 1f).apply { setMargins(dp(3), dp(3), dp(3), dp(3)) })
+                      }
+                      box.addView(lr)
+                  }
+
+                  label("WARNA CUSTOM (kode hex, contoh #FF4081)")
+                  val hexEt = field("#RRGGBB", false)
+                  box.addView(hexEt)
+                  box.addView(softBtn("TERAPKAN WARNA CUSTOM") {
+                      val h = Theme.hueOf(hexEt.text.toString().trim())
+                      if (h == null) toast("Kode warna tidak valid") else applyHue(h)
+                  }, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) })
+
+                  label("WALLPAPER BACKGROUND")
+                  box.addView(softBtn("PILIH GAMBAR / VIDEO WALLPAPER") {
+                      dlg.dismiss()
+                      val i = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+                          addCategory(Intent.CATEGORY_OPENABLE)
+                          type = "*/*"
+                          putExtra(Intent.EXTRA_MIME_TYPES, arrayOf("image/*", "video/*"))
+                      }
+                      try { startActivityForResult(i, REQ_WALL) } catch (e: Exception) { toast("Galeri tidak tersedia") }
+                  })
+                  if (Theme.hasVideo) {
+                      val muteBtn = softBtn("") {}
+                      fun lbl() {
+                          muteBtn.text = if (Theme.muted) "SUARA VIDEO: MUTE (ketuk = UNMUTE)" else "SUARA VIDEO: UNMUTE (ketuk = MUTE)"
+                          val ic = resources.getDrawable(if (Theme.muted) R.drawable.ic_vol_off else R.drawable.ic_vol_on, theme).mutate()
+                          ic.setTint(green)
+                          muteBtn.setCompoundDrawablesWithIntrinsicBounds(ic, null, null, null)
+                          muteBtn.compoundDrawablePadding = dp(8)
+                      }
+                      lbl()
+                      muteBtn.setOnClickListener { toggleMute(); lbl() }
+                      box.addView(muteBtn, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) })
+                  }
+                  box.addView(softBtn("HAPUS WALLPAPER") {
+                      Theme.clearWallpaper(this); dlg.dismiss(); recreate()
+                  }, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) })
+
+                  label("KEGELAPAN WALLPAPER")
+                  val dimRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+                  listOf("RINGAN", "SEDANG", "GELAP").forEachIndexed { i, name ->
+                      val c = chip(name) { Theme.setDim(this, i); dlg.dismiss(); recreate() }
+                      styleChip(c, Theme.dim == i)
+                      dimRow.addView(c, LinearLayout.LayoutParams(0, dp(40), 1f).apply { setMargins(dp(3), 0, dp(3), 0) })
+                  }
+                  box.addView(dimRow)
+
+                  dlg = AlertDialog.Builder(this)
+                      .setTitle("TEMA")
+                      .setView(ScrollView(this).apply { addView(box) })
+                      .setNegativeButton("TUTUP", null)
+                      .create()
+                  dlg.show()
+                  dlg.window?.setLayout((resources.displayMetrics.widthPixels * 0.94).toInt(), ViewGroup.LayoutParams.WRAP_CONTENT)
+              }
+
+              @Deprecated("Deprecated in Java")
+              override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+                  super.onActivityResult(requestCode, resultCode, data)
+                  if (requestCode != REQ_WALL || resultCode != RESULT_OK) return
+                  val uri = data?.data ?: return
+                  val isVideo = (contentResolver.getType(uri) ?: "").startsWith("video/")
+                  toast(if (isVideo) "Menyalin video…" else "Memuat gambar…")
+                  Thread {
+                      val ok = if (isVideo) Theme.saveVideo(this, uri) else Theme.saveWallpaper(this, uri)
+                      runOnUiThread {
+                          if (ok) recreate() else toast(if (isVideo) "Gagal memuat video (maks 150 MB)" else "Gagal memuat gambar")
+                      }
+                  }.start()
+              }
+
+              // daftar paket sebuah jenis server yang benar-benar terpasang
+              private fun serversOf(t: String): List<String> =
+                  Cfg.packages(this, t, all.map { it.pkg }).filter { it in installedSet }
+
+              private fun visible() = all.filter {
+                  (filter == 0 || (filter == 1 && !it.system) || (filter == 2 && it.system)) &&
+                      (query.isBlank() || it.label.contains(query, true) || it.pkg.contains(query, true))
+              }
+
+              private fun refresh() {
+                  tabBtns.forEachIndexed { i, b -> pill(b, i == tab) }
+                  filterBtns.forEachIndexed { i, b ->
+                      b.text = when (i) { 0 -> "ALL (${all.size})"; 1 -> "USER"; else -> "SYSTEM" }
+                      pill(b, i == filter)
+                  }
+                  serverPane.visibility = if (tab == 0 || tab == 1 || tab == 4) View.VISIBLE else View.GONE
+                  dataPane.visibility = if (tab == 2) View.VISIBLE else View.GONE
+                  adbPane.visibility = if (tab == 3) View.VISIBLE else View.GONE
+                  if (tab == 0 || tab == 1 || tab == 4) loadServerTab()
+                  if (tab == 3) adbSync()
+                  updateBanner()
+                  resetBtn.text = "RESET SELECTED DATA (${selected.size})"
+                  resetBtn.isEnabled = selected.isNotEmpty()
+                  resetBtn.alpha = if (selected.isNotEmpty()) 1f else 0.4f
+                  dataAdapter.notifyDataSetChanged()
+              }
+
+              private fun updateBanner() {
+                  val msg = when {
+                      tab == 2 && !dpm.isDeviceOwnerApp(packageName) && !rootMode() ->
+                          "Belum jadi Device Owner. Ketuk di sini, lalu pilih ADB atau ROOT di tab ADB/ROOT."
+                      (tab == 0 || tab == 1 || tab == 4) && !Settings.canDrawOverlays(this) ->
+                          "Izin 'tampil di atas aplikasi lain' belum aktif. Ketuk di sini untuk mengaktifkan."
+                      else -> ""
+                  }
+                  banner.text = msg
+                  banner.visibility = if (msg.isEmpty()) View.GONE else View.VISIBLE
+                  banner.setOnClickListener {
+                      if ((tab == 0 || tab == 1 || tab == 4) && !Settings.canDrawOverlays(this)) requestOverlay()
+                      else if (tab == 2 && !dpm.isDeviceOwnerApp(packageName) && !rootMode()) { tab = 3; refresh() }
+                  }
+              }
+
+              private fun requestOverlay() {
+                  startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
+              }
+
+              private fun accEnabled(): Boolean {
+                  val s = Settings.Secure.getString(contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES)
+                      ?: return false
+                  val cn = ComponentName(this, AutoService::class.java)
+                  val full = cn.flattenToString()
+                  val short = cn.flattenToShortString()
+                  return s.split(":").any { it.equals(full, true) || it.equals(short, true) }
+              }
+
+              // ===== tab NORMAL / ADVANCE =====
+
+              private fun loadServerTab() {
+                  val t = type()
+                  val byPkg = all.associateBy { it.pkg }
+                  serverItems = serversOf(t).mapNotNull { byPkg[it] }
+                  selSrv[t]!!.retainAll(serverItems.map { it.pkg }.toSet())
+                  refreshServerTitle()
+                  refreshAutoSub()
+                  srvAdapter.notifyDataSetChanged()
+              }
+
+              private fun refreshServerTitle() {
+                  srvTitle.text = "${type().uppercase()} · ${serverItems.size} server · dipilih ${selSrv[type()]!!.size}"
+              }
+
+              private fun refreshAutoSub() {
+                  val t = type()
+                  val c = Cfg.getInt(this, "$t.count", if (t == "gift") Cfg.GIFT_COUNT else Cfg.DEF_COUNT)
+                  val d1 = Cfg.getInt(this, "$t.d1", if (t == "gift") Cfg.GIFT_D1 else Cfg.DEF_D1)
+                  val d2 = Cfg.getInt(this, "$t.d2", if (t == "gift") Cfg.GIFT_D2 else Cfg.DEF_D2)
+                  autoSub.text = "$c server · delay ${fmt(d1)}"
+              }
+
+              private fun selectAllServers(flag: Boolean) {
+                  val s = selSrv[type()]!!
+                  if (flag) s.addAll(serverItems.map { it.pkg }) else s.clear()
+                  refreshServerTitle()
+                  srvAdapter.notifyDataSetChanged()
+              }
+
+              /** Buka satu server saja (tanpa urutan). */
+              private fun openOne(pkg: String) {
+                  val act = Cfg.get(this, type(), "act")
+                  try {
+                      val i = Intent().setComponent(ComponentName(pkg, act)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                      if (packageManager.resolveActivity(i, 0) == null) toast("Activity tidak ditemukan di $pkg")
+                      else startActivity(i)
+                  } catch (e: Exception) {
+                      toast("Gagal membuka $pkg")
+                  }
+              }
+
+              private fun startRun() {
+                  val t = type()
+                  val sel = selSrv[t]!!
+                  val checked = serverItems.map { it.pkg }.filter { it in sel }
+                  val pool = if (checked.isEmpty()) serverItems.map { it.pkg } else checked
+                  val count = Cfg.getInt(this, "$t.count", if (t == "gift") Cfg.GIFT_COUNT else Cfg.DEF_COUNT)
+                  val list = pool.take(count)
+                  if (list.isEmpty()) { toast("Tidak ada server untuk dibuka"); return }
+                  if (!Settings.canDrawOverlays(this)) {
+                      toast("Aktifkan izin tampil di atas aplikasi lain dulu")
+                      requestOverlay()
+                      return
+                  }
+                  val i = Intent(this, RunService::class.java)
+                      .putStringArrayListExtra(RunService.EXTRA_PKGS, ArrayList(list))
+                      .putExtra(RunService.EXTRA_ACT, Cfg.get(this, t, "act"))
+                      .putExtra(RunService.EXTRA_D1, Cfg.getInt(this, "$t.d1", Cfg.DEF_D1))
+                      .putExtra(RunService.EXTRA_D2, 0)
+                      .putExtra(RunService.EXTRA_CLOSE_END, Cfg.getInt(this, "$t.closeEnd", 0) == 1)
+                  startForegroundService(i)
+                  toast("OPEN ${list.size} server")
+              }
+
+              private fun closeRun() {
+                  stopService(Intent(this, RunService::class.java))
+                  val sel = selSrv[type()]!!
+                  val list = if (sel.isEmpty()) serverItems.map { it.pkg } else serverItems.map { it.pkg }.filter { it in sel }
+                  val am = getSystemService(ActivityManager::class.java)
+                  list.forEach {
+                      try { am.killBackgroundProcesses(it) } catch (_: Exception) {}
+                  }
+                  toast("CLOSE ${list.size} server")
+              }
+
+              // ===== nickname otomatis: pencari titik, tes, editor alur =====
+
+              private fun startPicker() {
+                  if (!Settings.canDrawOverlays(this)) {
+                      toast("Aktifkan izin overlay dulu")
+                      requestOverlay()
+                      return
+                  }
+                  toast("Pindah ke game. Overlay muncul 6 detik lagi")
+                  android.os.Handler(mainLooper).postDelayed({ PointPicker.show(this) }, 6000L)
+              }
+
+              private fun testNick() {
+                  val mode = Cfg.nickMode(this)
+                  if (mode == NickAuto.MODE_OFF) {
+                      toast("Pilih RANDOM atau REQUEST dulu")
+                      return
+                  }
+                  if (!accEnabled() && RootHelper.rooted != true) {
+                      toast("Aktifkan 'Rizzxy Store' di Accessibility dulu (atau pakai tombol AKTIFKAN AKSESIBILITAS di tab ADB/ROOT)")
+                      startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                      return
+                  }
+                  toast("TES mulai 8 detik lagi. Pindah ke layar nickname di game")
+                  val app = applicationContext
+                  Thread {
+                      val sl: (Long) -> Boolean = { ms ->
+                          try {
+                              Thread.sleep(ms)
+                              true
+                          } catch (e: InterruptedException) {
+                              false
+                          }
+                      }
+                      if (sl(8000L)) {
+                          NickAuto.run(app, mode, Cfg.nickStart(app), sl) { m -> runOnUiThread { toast(m) } }
+                      }
+                  }.start()
+              }
+
+              private fun openFlowEditor() {
+                  val box = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(dp(16), dp(8), dp(16), dp(8))
+                  }
+                  box.addView(TextView(this).apply {
+                      text = "Satu langkah per baris:\n" +
+                          "@x,y  = ketuk titik (pecahan layar 0-1)\n" +
+                          "@x,y*10  = ketuk 10 kali\n" +
+                          "!x,y  = tahan 1 detik (untuk Paste)\n" +
+                          "~2  = tunggu 2 detik\n" +
+                          "#  = catatan\n" +
+                          "Titik didapat dari CARI TITIK lalu tempel di sini."
+                      textSize = 11f
+                      setTextColor(muted)
+                  })
+                  fun field(title: String, value: String): EditText {
+                      box.addView(TextView(this).apply {
+                          text = title; setTextColor(cyan); typeface = Typeface.DEFAULT_BOLD
+                          setPadding(0, dp(12), 0, dp(4))
+                      })
+                      val e = EditText(this)
+                      e.setText(value)
+                      e.textSize = 12f
+                      e.typeface = Typeface.MONOSPACE
+                      e.inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE
+                      e.minLines = 5
+                      e.gravity = Gravity.TOP
+                      box.addView(e)
+                      return e
+                  }
+                  val reqEt = field("ALUR REQUEST (nick sendiri)", Cfg.nickFlow(this))
+                  val rndEt = field("ALUR RANDOM (ketuk-ketuk)", Cfg.nickRFlow(this))
+                  AlertDialog.Builder(this)
+                      .setTitle("EDIT ALUR TAP")
+                      .setView(ScrollView(this).apply { addView(box) })
+                      .setNegativeButton("BATAL", null)
+                      .setNeutralButton("DEFAULT") { _, _ ->
+                          Cfg.setNickFlow(this, Cfg.DEF_NICK_FLOW)
+                          Cfg.setNickRFlow(this, Cfg.DEF_NICK_RFLOW)
+                          toast("Alur dikembalikan ke contoh")
+                      }
+                      .setPositiveButton("SIMPAN") { _, _ ->
+                          Cfg.setNickFlow(this, reqEt.text.toString())
+                          Cfg.setNickRFlow(this, rndEt.text.toString())
+                          toast("Alur tersimpan")
+                      }
+                      .show()
+              }
+
+              // ===== dialog AUTO TASK =====
+
+              private fun openAuto() {
+                  val t = type()
+                  var count = Cfg.getInt(this, "$t.count", if (t == "gift") Cfg.GIFT_COUNT else Cfg.DEF_COUNT).coerceIn(2, 30)
+                  var d1 = Cfg.getInt(this, "$t.d1", if (t == "gift") Cfg.GIFT_D1 else Cfg.DEF_D1).coerceIn(2, 120)
+                  var d2 = Cfg.getInt(this, "$t.d2", if (t == "gift") Cfg.GIFT_D2 else Cfg.DEF_D2).coerceIn(0, 120)
+                  var closeEnd = Cfg.getInt(this, "$t.closeEnd", 0) == 1
+                  var nMode = Cfg.nickMode(this)
+                  var nPre = Cfg.nickPre(this)
+                  var nGap = Cfg.nickGapMs(this)
+                  var nAfter = Cfg.nickAfter(this)
+                  var nickEt: EditText? = null
+                  var startEt: EditText? = null
+                  var dlg: AlertDialog? = null
+                  val renders = mutableListOf<() -> Unit>()
+                  fun renderAll() { renders.forEach { it() } }
+
+                  fun save() {
+                      Cfg.setInt(this, "$t.count", count)
+                      Cfg.setInt(this, "$t.d1", d1)
+                      Cfg.setInt(this, "$t.d2", d2)
+                      Cfg.setInt(this, "$t.closeEnd", if (closeEnd) 1 else 0)
+                      Cfg.setNickMode(this, nMode)
+                      Cfg.setNickPre(this, nPre)
+                      Cfg.setNickGapMs(this, nGap)
+                      Cfg.setNickAfter(this, nAfter)
+                      nickEt?.let { Cfg.setNickText(this, it.text.toString()) }
+                      startEt?.let { Cfg.setNickStart(this, it.text.toString().trim().toIntOrNull() ?: Cfg.DEF_NICK_START) }
+                      refreshAutoSub()
+                  }
+
+                  fun label(s: String) = tv(s, 12f, cyan, true).apply { setPadding(dp(2), dp(16), 0, dp(8)) }
+
+                  val box = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(dp(18), dp(18), dp(18), dp(14))
+                      background = shape(Theme.s(0xFF120A21.toInt()), 24, 1, line)
+                  }
+
+                  // judul + DEFAULT
+                  val top = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      gravity = Gravity.CENTER_VERTICAL
+                  }
+                  val topIcon = tv("⇅", 20f, cyan, true).apply {
+                      gravity = Gravity.CENTER
+                      background = shape(Theme.t(0xFF3B1A66.toInt()), 24, 1, cyan)
+                  }
+                  top.addView(topIcon, LinearLayout.LayoutParams(dp(48), dp(48)))
+                  val topTexts = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+                  topTexts.addView(tv("AUTO TASK", 18f, 0xFFFFFFFF.toInt(), true))
+                  topTexts.addView(tv("SEQUENCE CONFIGURATION", 10f, muted))
+                  top.addView(topTexts, LinearLayout.LayoutParams(0, -2, 1f).apply { leftMargin = dp(12) })
+                  val defBtn = tv("↺ DEFAULT", 11f, white, true).apply {
+                      gravity = Gravity.CENTER
+                      setPadding(dp(12), dp(10), dp(12), dp(10))
+                      background = shape(cardDark, 12, 1, line)
+                      setOnClickListener {
+                          count = if (t == "gift") Cfg.GIFT_COUNT else Cfg.DEF_COUNT; d1 = if (t == "gift") Cfg.GIFT_D1 else Cfg.DEF_D1; d2 = if (t == "gift") Cfg.GIFT_D2 else Cfg.DEF_D2; closeEnd = false
+                          renderAll()
+                      }
+                  }
+                  top.addView(defBtn)
+                  box.addView(top)
+
+                  // 1. jumlah server
+                  box.addView(label("1. TARGET SERVERS COUNT (2 TO 30):"))
+                  val countBox = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      background = shape(cardDark, 16, 1, Theme.t(0xFF24173D.toInt()))
+                      setPadding(dp(10), dp(10), dp(10), dp(10))
+                  }
+                  val countRow = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      gravity = Gravity.CENTER_VERTICAL
+                  }
+                  countRow.addView(stepBtn("-") { count = (count - 1).coerceAtLeast(2); renderAll() },
+                      LinearLayout.LayoutParams(dp(56), dp(52)))
+                  val center = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      gravity = Gravity.CENTER
+                  }
+                  val numTv = tv("", 30f, 0xFFFFFFFF.toInt(), true)
+                  center.addView(numTv)
+                  center.addView(tv(" SERVERS", 22f, cyan, true))
+                  countRow.addView(center, LinearLayout.LayoutParams(0, -2, 1f))
+                  countRow.addView(stepBtn("+") { count = (count + 1).coerceAtMost(30); renderAll() },
+                      LinearLayout.LayoutParams(dp(56), dp(52)))
+                  countBox.addView(countRow)
+                  val countPresets = listOf(2, 5, 10, 15, 20, 30)
+                  val presetRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+                  val countChips = countPresets.map { p ->
+                      chip("$p") { count = p; renderAll() }.also {
+                          presetRow.addView(it, LinearLayout.LayoutParams(0, dp(42), 1f).apply { setMargins(dp(3), 0, dp(3), 0) })
+                      }
+                  }
+                  countBox.addView(presetRow, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(10) })
+                  box.addView(countBox)
+                  renders.add {
+                      numTv.text = count.toString()
+                      countChips.forEachIndexed { i, c -> styleChip(c, countPresets[i] == count) }
+                  }
+
+                  // 2. jeda
+                  fun delayBlock(title: String, presets: List<Int>, min: Int, get: () -> Int, put: (Int) -> Unit): View {
+                      val wrap = LinearLayout(this).apply {
+                          orientation = LinearLayout.VERTICAL
+                          background = shape(cardDark, 16, 1, Theme.t(0xFF24173D.toInt()))
+                          setPadding(dp(12), dp(10), dp(12), dp(12))
+                      }
+                      val hd = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+                      hd.addView(tv(title, 10f, muted, true), LinearLayout.LayoutParams(0, -2, 1f))
+                      val valTv = tv("", 14f, cyan, true)
+                      hd.addView(valTv)
+                      wrap.addView(hd)
+                      val row = LinearLayout(this).apply {
+                          orientation = LinearLayout.HORIZONTAL
+                          gravity = Gravity.CENTER_VERTICAL
+                      }
+                      row.addView(stepBtn("-") {
+                          val v = get()
+                          put((v - (if (v <= 30) 1 else 5)).coerceAtLeast(min)); renderAll()
+                      }, LinearLayout.LayoutParams(dp(38), dp(44)))
+                      val chips = presets.map { p ->
+                          chip(fmt(p)) { put(p); renderAll() }.also {
+                              row.addView(it, LinearLayout.LayoutParams(0, dp(44), 1f).apply { setMargins(dp(3), 0, dp(3), 0) })
+                          }
+                      }
+                      row.addView(stepBtn("+") {
+                          val v = get()
+                          put((v + (if (v < 30) 1 else 5)).coerceAtMost(120)); renderAll()
+                      }, LinearLayout.LayoutParams(dp(38), dp(44)))
+                      wrap.addView(row, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) })
+                      renders.add {
+                          valTv.text = fmt(get())
+                          chips.forEachIndexed { i, c -> styleChip(c, presets[i] == get()) }
+                      }
+                      return wrap
+                  }
+
+                  box.addView(label("2. STAGE DELAY TIMINGS:"))
+                  box.addView(
+                      delayBlock("DELAY TIAP SERVER:", listOf(3, 5, 10, 15, 30, 60), 2, { d1 }, { d1 = it }),
+                      LinearLayout.LayoutParams(-1, -2)
+                  )
+
+                  // 2B. nickname otomatis (RUN 2)
+                  box.addView(label("2B. NICKNAME OTOMATIS:"))
+                  val nickBox = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      background = shape(cardDark, 16, 1, Theme.t(0xFF24173D.toInt()))
+                      setPadding(dp(12), dp(10), dp(12), dp(12))
+                  }
+                  val modeNames = listOf("OFF", "RANDOM", "REQUEST")
+                  val modeRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+                  val modeChips = modeNames.mapIndexed { i, nm ->
+                      chip(nm) { nMode = i; renderAll() }.also {
+                          modeRow.addView(it, LinearLayout.LayoutParams(0, dp(44), 1f).apply { setMargins(dp(3), 0, dp(3), 0) })
+                      }
+                  }
+                  nickBox.addView(modeRow)
+                  val nickHint = tv("", 10f, muted).apply { setPadding(dp(2), dp(8), dp(2), dp(4)) }
+                  nickBox.addView(nickHint)
+
+                  val reqBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+                  reqBox.addView(tv("Nickname", 10f, muted, true))
+                  val nEt = EditText(this)
+                  nEt.setText(Cfg.nickText(this))
+                  nEt.textSize = 13f
+                  nEt.setSingleLine()
+                  nEt.inputType = InputType.TYPE_CLASS_TEXT
+                  nickEt = nEt
+                  reqBox.addView(nEt)
+                  reqBox.addView(tv("Nomor awal (naik 1 tiap server)", 10f, muted, true).apply { setPadding(0, dp(8), 0, 0) })
+                  val sEt = EditText(this)
+                  sEt.setText("%03d".format(Cfg.nickStart(this)))
+                  sEt.textSize = 13f
+                  sEt.setSingleLine()
+                  sEt.inputType = InputType.TYPE_CLASS_NUMBER
+                  startEt = sEt
+                  reqBox.addView(sEt)
+                  nickBox.addView(reqBox)
+
+                  fun numRow(title: String, get: () -> Int, put: (Int) -> Unit, min: Int, max: Int, stepBy: Int, show: (Int) -> String): View {
+                      val row = LinearLayout(this).apply {
+                          orientation = LinearLayout.HORIZONTAL
+                          gravity = Gravity.CENTER_VERTICAL
+                      }
+                      row.addView(tv(title, 10f, muted, true), LinearLayout.LayoutParams(0, -2, 1f))
+                      row.addView(stepBtn("-") { put((get() - stepBy).coerceAtLeast(min)); renderAll() },
+                          LinearLayout.LayoutParams(dp(38), dp(40)))
+                      val v = tv("", 13f, cyan, true).apply { gravity = Gravity.CENTER }
+                      row.addView(v, LinearLayout.LayoutParams(dp(70), -2))
+                      row.addView(stepBtn("+") { put((get() + stepBy).coerceAtMost(max)); renderAll() },
+                          LinearLayout.LayoutParams(dp(38), dp(40)))
+                      renders.add { v.text = show(get()) }
+                      return row
+                  }
+
+                  val timeBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+                  timeBox.addView(numRow("TUNGGU SEBELUM MULAI", { nPre }, { nPre = it }, 0, 60, 1) { "${it}s" },
+                      LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(10) })
+                  timeBox.addView(numRow("JEDA ANTAR KETUKAN", { nGap }, { nGap = it }, 200, 5000, 100) { "${it} ms" },
+                      LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(6) })
+                  timeBox.addView(numRow("TUNGGU SETELAH SELESAI", { nAfter }, { nAfter = it }, 0, 60, 1) { "${it}s" },
+                      LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(6) })
+
+                  val toolRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+                  toolRow.addView(softBtn("EDIT ALUR") { save(); openFlowEditor() },
+                      LinearLayout.LayoutParams(0, -2, 1f).apply { rightMargin = dp(3) })
+                  toolRow.addView(softBtn("CARI TITIK") { save(); dlg?.dismiss(); startPicker() },
+                      LinearLayout.LayoutParams(0, -2, 1f).apply { leftMargin = dp(3); rightMargin = dp(3) })
+                  toolRow.addView(softBtn("TES") { save(); dlg?.dismiss(); testNick() },
+                      LinearLayout.LayoutParams(0, -2, 1f).apply { leftMargin = dp(3) })
+                  timeBox.addView(toolRow, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(12) })
+                  nickBox.addView(timeBox)
+                  box.addView(nickBox, LinearLayout.LayoutParams(-1, -2))
+
+                  renders.add {
+                      modeChips.forEachIndexed { i, c -> styleChip(c, i == nMode) }
+                      reqBox.visibility = if (nMode == 2) View.VISIBLE else View.GONE
+                      timeBox.visibility = if (nMode == 0) View.GONE else View.VISIBLE
+                      nickHint.text = when {
+                          nMode == 0 -> "Mati. Server hanya dibuka satu per satu."
+                          nMode == 1 -> "Setelah delay habis: ketuk-ketuk otomatis sesuai alur RANDOM, lalu langsung ganti apk. Hanya 1 putaran."
+                          else -> "Setelah delay habis: nick disalin ke clipboard, lalu alur REQUEST (pilih kolom, paste, OK, skip), lalu langsung ganti apk. Hanya 1 putaran."
+                      }
+                  }
+
+                  val closeTv = tv("", 12f, muted).apply {
+                      setPadding(dp(4), dp(12), dp(4), dp(4))
+                      setOnClickListener { closeEnd = !closeEnd; renderAll() }
+                  }
+                  box.addView(closeTv)
+                  renders.add { closeTv.text = (if (closeEnd) "☑ " else "☐ ") + "Tutup semua server di akhir urutan" }
+
+                  // 3. izin
+                  box.addView(label("3. SYSTEM PERMISSIONS STATUS:"))
+                  val permRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+                  fun permChip(name: String, ok: () -> Boolean, onClick: () -> Unit): View {
+                      val c = LinearLayout(this).apply {
+                          orientation = LinearLayout.VERTICAL
+                          gravity = Gravity.CENTER
+                          setPadding(dp(8), dp(12), dp(8), dp(12))
+                          setOnClickListener { onClick() }
+                      }
+                      val icon = tv("", 20f, green, true).apply { gravity = Gravity.CENTER }
+                      val nm = tv(name, 11f, white, true).apply { gravity = Gravity.CENTER }
+                      c.addView(icon)
+                      c.addView(nm)
+                      renders.add {
+                          val good = ok()
+                          icon.text = if (good) "✓" else "✕"
+                          icon.setTextColor(if (good) green else red)
+                          c.background = shape(if (good) Theme.t(0xFF2A1650.toInt()) else 0xFF2A1418.toInt(), 14, 1, if (good) btnLine else 0xFF7F1D1D.toInt())
+                      }
+                      return c
+                  }
+                  permRow.addView(
+                      permChip("OVERLAY", { Settings.canDrawOverlays(this) }) {
+                          save(); dlg?.dismiss(); requestOverlay()
+                      },
+                      LinearLayout.LayoutParams(0, -2, 1f).apply { rightMargin = dp(4) }
+                  )
+                  permRow.addView(
+                      permChip("ACCESSIBILITY", { accEnabled() }) {
+                          save(); dlg?.dismiss()
+                          toast("Aktifkan 'Rizzxy Store' di Accessibility")
+                          startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                      },
+                      LinearLayout.LayoutParams(0, -2, 1f).apply { leftMargin = dp(4) }
+                  )
+                  box.addView(permRow)
+
+                  // tombol bawah
+                  val actions = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+                  val saveBtn = tv("SAVE & CLOSE", 13f, Theme.t(0xFFDDD6FE.toInt()), true).apply {
+                      gravity = Gravity.CENTER
+                      background = shape(cardDark, 16, 1, Theme.t(0xFF24173D.toInt()))
+                      setOnClickListener { save(); dlg?.dismiss() }
+                  }
+                  val startBtn = tv("▶ START", 14f, Theme.t(0xFF1E0B3A.toInt()), true).apply {
+                      gravity = Gravity.CENTER
+                      background = shape(cyan, 16)
+                      setOnClickListener { save(); dlg?.dismiss(); startRun() }
+                  }
+                  actions.addView(saveBtn, LinearLayout.LayoutParams(0, dp(54), 1f).apply { rightMargin = dp(5) })
+                  actions.addView(startBtn, LinearLayout.LayoutParams(0, dp(54), 1.2f).apply { leftMargin = dp(5) })
+                  box.addView(actions, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(18) })
+
+                  renderAll()
+
+                  val d = AlertDialog.Builder(this).setView(ScrollView(this).apply { addView(box) }).create()
+                  dlg = d
+                  d.window?.setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
+                  d.show()
+                  d.window?.setLayout((resources.displayMetrics.widthPixels * 0.94).toInt(), ViewGroup.LayoutParams.WRAP_CONTENT)
+              }
+
+              // ===== tab ADB nirkabel =====
+
+              private fun field(hintText: String, numeric: Boolean): EditText = EditText(this).apply {
+                  hint = hintText
+                  setHintTextColor(muted); setTextColor(white); textSize = 14f
+                  setSingleLine()
+                  background = shape(cardDark, 12, 1, line)
+                  setPadding(dp(12), dp(10), dp(12), dp(10))
+                  if (numeric) inputType = InputType.TYPE_CLASS_NUMBER
+              }
+
+              private fun rootMode() = Cfg.getInt(this, "accessMode", 0) == 1
+
+              private fun applyMode() {
+                  if (!::adbGroup.isInitialized) return
+                  val r = rootMode()
+                  adbGroup.visibility = if (r) View.GONE else View.VISIBLE
+                  rootGroup.visibility = if (r) View.VISIBLE else View.GONE
+                  modeBtns.forEachIndexed { i, b -> pill(b, (i == 1) == r) }
+                  adbSync()
+              }
+
+              private fun buildAdbPane(): ScrollView {
+                  val outer = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(0, dp(8), 0, dp(8))
+                  }
+                  val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+                  adbGroup = box
+                  fun lbl(t: String) = tv(t, 10f, muted, true).apply { setPadding(dp(2), dp(12), 0, dp(4)) }
+                  fun wide(v: View, top: Int = 8) = box.addView(v, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(top) })
+
+                  adbStatus = tv("", 12f, white, true).apply {
+                      setPadding(dp(14), dp(12), dp(14), dp(12))
+                      background = shape(card, 16, 1, line)
+                  }
+                  outer.addView(adbStatus, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(4) })
+
+                  // pilih tipe akses: ADB (nirkabel) atau ROOT (langsung)
+                  val modeRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+                  listOf("ADB", "ROOT").forEachIndexed { i, name ->
+                      val b = mkBtn(name) {
+                          Cfg.setInt(this, "accessMode", i)
+                          applyMode(); updateBanner()
+                      }
+                      modeBtns += b
+                      modeRow.addView(b, LinearLayout.LayoutParams(0, dp(46), 1f).apply {
+                          if (i == 0) rightMargin = dp(4) else leftMargin = dp(4)
+                      })
+                  }
+                  outer.addView(modeRow, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) })
+                  outer.addView(box, LinearLayout.LayoutParams(-1, -2))
+
+                  // ===== mode ROOT =====
+                  val rg = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+                  rootGroup = rg
+                  fun rwide(v: View, top: Int = 8) = rg.addView(v, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(top) })
+                  rwide(tv("Mode ROOT: untuk HP yang sudah root (Magisk / KernelSU / APatch), tanpa ADB dan tanpa PC. " +
+                      "Ketuk CEK AKSES ROOT lalu izinkan permintaan root. Setelah itu tab DATA bisa menghapus data aplikasi " +
+                      "langsung lewat root, tidak perlu Device Owner.", 11f, muted), 12)
+                  rwide(colorBtn("CEK AKSES ROOT", Theme.t(0xFF7C3AED.toInt())) {
+                      adbAsync("CEK ROOT") {
+                          if (!RootHelper.check()) {
+                              throw IllegalStateException("Akses root ditolak / tidak ada. Izinkan Rizzxy Store di Magisk/KernelSU lalu ulangi")
+                          }
+                          AdbHelper.log("Root OK (uid=0)")
+                      }
+                  }, 14)
+                  rwide(colorBtn("AKTIFKAN AKSESIBILITAS (AUTO)", Theme.t(0xFF7C3AED.toInt())) { enableAccAuto(true) })
+                  rwide(colorBtn("SET DEVICE OWNER (ROOT) — opsional", Theme.t(0xFF6D28D9.toInt())) {
+                      adbAsync("SET DEVICE OWNER (ROOT)") {
+                          val out = RootHelper.setDeviceOwner(packageName)
+                          AdbHelper.log(out)
+                          if (out.contains("already some accounts", true)) {
+                              throw IllegalStateException("Hapus semua akun (Google dll.) di perangkat dulu, lalu ulangi")
+                          }
+                          if (out.contains("Exception", true) || out.contains("Error", true)) {
+                              throw IllegalStateException(out.lines().firstOrNull().orEmpty().take(120))
+                          }
+                      }
+                  })
+                  outer.addView(rg, LinearLayout.LayoutParams(-1, -2))
+
+                  if (Build.VERSION.SDK_INT < 30) {
+                      wide(tv("ADB nirkabel butuh Android 11 atau lebih baru.", 12f, red))
+                  }
+
+                  wide(tv("Aktifkan Opsi Pengembang → Debugging nirkabel (harus tersambung Wi-Fi), lalu isi data di bawah. " +
+                      "Port bisa dideteksi otomatis.", 11f, muted))
+                  wide(softBtn("BUKA OPSI PENGEMBANG") {
+                      try { startActivity(Intent(Settings.ACTION_APPLICATION_DEVELOPMENT_SETTINGS)) }
+                      catch (e: Exception) { toast("Tidak bisa membuka Opsi Pengembang") }
+                  })
+
+                  box.addView(lbl("IP PERANGKAT"))
+                  adbIp = field("192.168.x.x", false)
+                  adbIp.setText(AdbHelper.localIp())
+                  box.addView(adbIp)
+
+                  box.addView(lbl("PORT PAIRING          KODE PAIRING (6 DIGIT)"))
+                  adbPairPort = field("port", true)
+                  adbCode = field("000000", true)
+                  val row1 = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+                  row1.addView(adbPairPort, LinearLayout.LayoutParams(0, -2, 1f).apply { rightMargin = dp(4) })
+                  row1.addView(adbCode, LinearLayout.LayoutParams(0, -2, 1f).apply { leftMargin = dp(4) })
+                  box.addView(row1)
+
+                  box.addView(lbl("PORT CONNECT"))
+                  adbConnPort = field("port", true)
+                  box.addView(adbConnPort)
+
+                  fun ip() = adbIp.text.toString().trim()
+                  fun num(e: EditText) = e.text.toString().trim().toIntOrNull() ?: 0
+
+                  wide(softBtn("↻ DETEKSI PORT OTOMATIS") {
+                      AdbHelper.startDiscovery(this)
+                      toast("Mendeteksi… buka dialog pairing / aktifkan Debugging nirkabel")
+                  }, 14)
+                  wide(colorBtn("PAIR + CONNECT", Theme.t(0xFF7C3AED.toInt())) {
+                      val code = adbCode.text.toString().trim()
+                      if (code.length != 6) { toast("Kode pairing harus 6 digit"); return@colorBtn }
+                      val h = ip(); val pp = num(adbPairPort); val cp = num(adbConnPort)
+                      AdbHelper.startDiscovery(this)
+                      adbAsync("PAIR + CONNECT") { AdbHelper.pairAndConnect(this, code, h, pp, cp) }
+                  })
+                  wide(softBtn("PAIR VIA NOTIFIKASI (dialog tetap terbuka)") {
+                      AdbHelper.startDiscovery(this)
+                      AdbHelper.postPairNotification(this)
+                      toast("Buka dialog 'Pair device with pairing code', tarik notifikasi, ketik kodenya")
+                  })
+                  wide(softBtn("CONNECT SAJA (sudah pernah pairing)") {
+                      val h = ip(); val cp = num(adbConnPort)
+                      AdbHelper.startDiscovery(this)
+                      adbAsync("CONNECT") { AdbHelper.connectAuto(this, h, cp) }
+                  })
+                  wide(colorBtn("AKTIFKAN AKSESIBILITAS (AUTO)", Theme.t(0xFF7C3AED.toInt())) { enableAccAuto(false) }, 14)
+                  wide(colorBtn("SET DEVICE OWNER", Theme.t(0xFF6D28D9.toInt())) {
+                      adbAsync("SET DEVICE OWNER") {
+                          if (!AdbHelper.connected) throw IllegalStateException("Belum terhubung ke ADB")
+                          val out = AdbHelper.run(this, "dpm set-device-owner $packageName/.AdminReceiver").trim()
+                          AdbHelper.log(out)
+                          if (out.contains("already some accounts", true)) {
+                              throw IllegalStateException("Hapus semua akun (Google dll.) di perangkat dulu, lalu ulangi")
+                          }
+                          if (out.contains("Exception", true) || out.contains("Error", true)) {
+                              throw IllegalStateException(out.lines().firstOrNull().orEmpty().take(120))
+                          }
+                      }
+                  }, 14)
+                  wide(softBtn("PUTUSKAN ADB") {
+                      AdbHelper.disconnect()
+                      AdbHelper.stopDiscovery()
+                      adbSync()
+                  })
+
+                  outer.addView(lbl("LOG"))
+                  adbLog = tv("", 10f, cyan).apply {
+                      typeface = Typeface.MONOSPACE
+                      setPadding(dp(12), dp(10), dp(12), dp(10))
+                      background = shape(cardDark, 12, 1, line)
+                  }
+                  outer.addView(adbLog)
+
+                  applyMode()
+                  return ScrollView(this).apply { addView(outer) }
+              }
+
+              /**
+               * Aktifkan layanan Aksesibilitas (izin ketuk layar) otomatis tanpa buka Pengaturan:
+               * beri WRITE_SECURE_SETTINGS lewat ROOT / ADB, lalu tulis daftar layanan aktif.
+               */
+              private fun enableAccAuto(viaRoot: Boolean) {
+                  adbAsync("AKTIFKAN AKSESIBILITAS") {
+                      val grant = "pm grant $packageName android.permission.WRITE_SECURE_SETTINGS"
+                      val raw: String
+                      if (viaRoot) {
+                          raw = RootHelper.run(grant)
+                      } else {
+                          if (!AdbHelper.connected) throw IllegalStateException("Belum terhubung ke ADB")
+                          raw = AdbHelper.run(this, grant)
+                      }
+                      val out = raw.trim()
+                      if (out.isNotEmpty()) AdbHelper.log(out)
+                      if (out.contains("Exception", true) || out.contains("Error", true)) {
+                          throw IllegalStateException(out.lines().firstOrNull().orEmpty().take(120))
+                      }
+                      val cn = ComponentName(this, AutoService::class.java)
+                      val full = cn.flattenToString()
+                      val short = cn.flattenToShortString()
+                      val cur = Settings.Secure.getString(contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES) ?: ""
+                      if (!cur.split(":").any { it.equals(full, true) || it.equals(short, true) }) {
+                          val nv = if (cur.isEmpty()) full else "$cur:$full"
+                          Settings.Secure.putString(contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES, nv)
+                      }
+                      Settings.Secure.putInt(contentResolver, Settings.Secure.ACCESSIBILITY_ENABLED, 1)
+                      AdbHelper.log("Aksesibilitas Rizzxy Store aktif")
+                  }
+              }
+
+              private fun adbAsync(label: String, work: () -> Unit) {
+                  AdbHelper.log("▶ $label")
+                  Thread {
+                      try {
+                          work()
+                          AdbHelper.log("✓ $label")
+                      } catch (e: Throwable) {
+                          AdbHelper.log("✕ $label: " + (e.message ?: e.javaClass.simpleName))
+                      }
+                      runOnUiThread { updateBanner(); adbSync() }
+                  }.start()
+              }
+
+              /** Segarkan status, log, dan isi kolom port dari hasil deteksi. */
+              private fun adbSync() {
+                  if (!::adbLog.isInitialized) return
+                  val owner = dpm.isDeviceOwnerApp(packageName)
+                  val good: Boolean
+                  val head: String
+                  if (rootMode()) {
+                      val r = RootHelper.rooted
+                      good = r == true
+                      head = "ROOT: " + when (r) { true -> "TERSEDIA ✓"; false -> "TIDAK ADA"; null -> "BELUM DICEK" }
+                  } else {
+                      good = AdbHelper.connected
+                      head = if (AdbHelper.connected) "ADB: TERHUBUNG ✓" else "ADB: BELUM TERHUBUNG"
+                  }
+                  adbStatus.text = head + "   ·   Device Owner: " + (if (owner) "YA ✓" else "TIDAK")
+                  adbStatus.setTextColor(if (good) green else white)
+                  val pp = AdbHelper.pairPort
+                  if (pp > 0 && adbPairPort.text.toString() != pp.toString()) adbPairPort.setText(pp.toString())
+                  val cp = AdbHelper.connPort
+                  if (cp > 0 && adbConnPort.text.toString() != cp.toString()) adbConnPort.setText(cp.toString())
+                  adbLog.text = AdbHelper.logText().ifEmpty { "(belum ada aktivitas)" }
+              }
+
+              // ===== pengaturan paket =====
+
+              private fun openSettings() {
+                  val box = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(dp(16), dp(8), dp(16), dp(8))
+                  }
+                  val fields = mutableListOf<Triple<String, String, EditText>>()
+                  fun section(t: String, title: String) {
+                      box.addView(TextView(this).apply {
+                          text = title; setTextColor(cyan); typeface = Typeface.DEFAULT_BOLD
+                          setPadding(0, dp(14), 0, dp(4))
+                      })
+                      val labels = listOf(
+                          "prefix" to "Awalan paket",
+                          "suffix" to "Akhiran (pisah koma). Kosong = semua paket terpasang yang berawalan itu",
+                          "extras" to "Paket tambahan (pisah koma)",
+                          "act" to "Nama activity pembuka"
+                      )
+                      labels.forEach { (f, label) ->
+                          box.addView(TextView(this).apply { text = label; textSize = 11f; setTextColor(muted) })
+                          val e = EditText(this)
+                          e.setText(Cfg.get(this, t, f))
+                          e.textSize = 12f
+                          e.setSingleLine()
+                          box.addView(e)
+                          fields.add(Triple(t, f, e))
+                      }
+                  }
+                  section("normal", "SERVER NORMAL")
+                  section("advance", "SERVER ADVANCE")
+                  AlertDialog.Builder(this)
+                      .setTitle("PENGATURAN PAKET")
+                      .setView(ScrollView(this).apply { addView(box) })
+                      .setNegativeButton("BATAL", null)
+                      .setNeutralButton("DEFAULT") { _, _ -> Cfg.reset(this); refresh() }
+                      .setPositiveButton("SIMPAN") { _, _ ->
+                          fields.forEach { (t, f, e) -> Cfg.set(this, t, f, e.text.toString()) }
+                          refresh()
+                          toast("Tersimpan")
+                      }
+                      .show()
+              }
+
+              // ===== DATA: hapus data =====
+
+              private fun openConsole() {
+                  val viaRoot = rootMode()
+                  if (!viaRoot && !dpm.isDeviceOwnerApp(packageName)) { toast("Belum jadi Device Owner (atau pilih mode ROOT di tab ADB/ROOT)"); return }
+                  val targets = selected.toList()
+                  val tv = TextView(this).apply {
+                      typeface = Typeface.MONOSPACE; textSize = 11f; setTextColor(cyan)
+                      setPadding(dp(16), dp(12), dp(16), dp(12))
+                      text = buildString {
+                          append("$ rizzxy-cli --reset --targets=${targets.size}\n")
+                          append(if (viaRoot) "> MODE: ROOT DIRECT PURGE\n" else "> MODE: DEVICE OWNER DIRECT PURGE\n")
+                          append("> SELECTED TARGET LIST:\n")
+                          targets.forEach { append("  • $it\n") }
+                      }
+                  }
+                  AlertDialog.Builder(this)
+                      .setTitle("RIZZXY // CONSOLE")
+                      .setView(ScrollView(this).apply { addView(tv) })
+                      .setNegativeButton("CANCEL", null)
+                      .setPositiveButton("EXECUTE") { _, _ -> if (viaRoot) executeRoot(targets) else execute(targets) }
+                      .show()
+              }
+
+              private fun execute(targets: List<String>) {
+                  val ex = Executors.newSingleThreadExecutor()
+                  var done = 0
+                  var ok = 0
+                  fun step(success: Boolean) {
+                      runOnUiThread {
+                          done++; if (success) ok++
+                          if (done == targets.size) {
+                              toast("CLEARED $ok APPS" + if (ok < done) " (${done - ok} gagal)" else "")
+                              selected.clear(); refresh()
+                          }
+                      }
+                  }
+                  for (p in targets) {
+                      try {
+                          dpm.clearApplicationUserData(admin, p, ex) { _, success -> step(success) }
+                      } catch (e: Exception) {
+                          step(false)
+                      }
+                  }
+              }
+
+              private fun executeRoot(targets: List<String>) {
+                  Thread {
+                      var ok = 0
+                      for (p in targets) {
+                          try { if (RootHelper.clearData(p)) ok++ } catch (e: Exception) {
+                              AdbHelper.log("✕ clear $p: " + (e.message ?: e.javaClass.simpleName))
+                          }
+                      }
+                      runOnUiThread {
+                          toast("CLEARED $ok APPS" + if (ok < targets.size) " (${targets.size - ok} gagal)" else "")
+                          selected.clear(); refresh()
+                      }
+                  }.start()
+              }
+
+              private fun confirmReleaseOwner() {
+                  if (!dpm.isDeviceOwnerApp(packageName)) return
+                  AlertDialog.Builder(this)
+                      .setTitle("Lepas Device Owner?")
+                      .setMessage("Aplikasi ini tidak lagi bisa menghapus data aplikasi lain sampai di-set ulang lewat adb.")
+                      .setNegativeButton("BATAL", null)
+                      .setPositiveButton("LEPAS") { _, _ ->
+                          @Suppress("DEPRECATION") dpm.clearDeviceOwnerApp(packageName)
+                          toast("Device Owner dilepas")
+                      }.show()
+              }
+
+              private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_SHORT).show()
+
+              // ===== adapter daftar server (kartu + tombol OPEN) =====
+
+              inner class ServerAdapter : BaseAdapter() {
+                  override fun getCount() = serverItems.size
+                  override fun getItem(i: Int) = serverItems[i]
+                  override fun getItemId(i: Int) = i.toLong()
+
+                  override fun getView(i: Int, convert: View?, parent: ViewGroup): View {
+                      val row = serverItems[i]
+                      val on = selSrv[type()]!!.contains(row.pkg)
+                      val toggle = {
+                          val s = selSrv[type()]!!
+                          if (!s.add(row.pkg)) s.remove(row.pkg)
+                          refreshServerTitle()
+                          notifyDataSetChanged()
+                      }
+
+                      val check = tv("✓", 20f, if (on) green else 0xFF334155.toInt(), true).apply {
+                          gravity = Gravity.CENTER
+                          background = shape(if (on) Theme.t(0xFF2A1650.toInt()) else cardDark, 12, 1, if (on) btnLine else Theme.t(0xFF24173D.toInt()))
+                          setOnClickListener { toggle() }
+                      }
+                      val names = LinearLayout(this@MainActivity).apply { orientation = LinearLayout.VERTICAL }
+                      names.addView(tv(row.label.uppercase(), 15f, 0xFFFFFFFF.toInt(), true).apply { setSingleLine() })
+                      names.addView(tv(type().uppercase(), 11f, muted).apply { setSingleLine() })
+
+                      val inner = LinearLayout(this@MainActivity).apply {
+                          orientation = LinearLayout.HORIZONTAL
+                          gravity = Gravity.CENTER_VERTICAL
+                          background = shape(card, 16, 1, line)
+                          setPadding(dp(12), dp(12), dp(12), dp(12))
+                          setOnClickListener { toggle() }
+                      }
+                      inner.addView(check, LinearLayout.LayoutParams(dp(46), dp(46)))
+                      inner.addView(names, LinearLayout.LayoutParams(0, -2, 1f).apply {
+                          leftMargin = dp(14); rightMargin = dp(8)
+                      })
+                      inner.addView(softBtn("▶ OPEN") { openOne(row.pkg) })
+
+                      return LinearLayout(this@MainActivity).apply {
+                          setPadding(0, dp(4), 0, dp(4))
+                          addView(inner, LinearLayout.LayoutParams(-1, -2))
+                      }
+                  }
+              }
+
+              // ===== adapter daftar aplikasi (tab DATA) =====
+
+              inner class RowAdapter(
+                  private val items: () -> List<AppRow>,
+                  private val isSel: (String) -> Boolean,
+                  private val toggle: (String) -> Unit
+              ) : BaseAdapter() {
+                  override fun getCount() = items().size
+                  override fun getItem(i: Int) = items()[i]
+                  override fun getItemId(i: Int) = i.toLong()
+
+                  override fun getView(i: Int, convert: View?, parent: ViewGroup): View {
+                      val row = items()[i]
+                      val box = CheckBox(this@MainActivity).apply {
+                          isChecked = isSel(row.pkg)
+                          isClickable = false; isFocusable = false
+                      }
+                      val icon = ImageView(this@MainActivity).apply {
+                          try { setImageDrawable(packageManager.getApplicationIcon(row.pkg)) } catch (_: Exception) {}
+                      }
+                      val names = LinearLayout(this@MainActivity).apply {
+                          orientation = LinearLayout.VERTICAL
+                          addView(TextView(this@MainActivity).apply {
+                              text = row.label; setTextColor(white); textSize = 13f
+                              typeface = Typeface.DEFAULT_BOLD; setSingleLine()
+                          })
+                          addView(TextView(this@MainActivity).apply {
+                              text = row.pkg; setTextColor(muted); textSize = 10f; setSingleLine()
+                          })
+                      }
+                      return LinearLayout(this@MainActivity).apply {
+                          orientation = LinearLayout.HORIZONTAL
+                          gravity = Gravity.CENTER_VERTICAL
+                          setPadding(dp(6), dp(6), dp(6), dp(6))
+                          addView(box)
+                          addView(icon, LinearLayout.LayoutParams(dp(34), dp(34)).apply { setMargins(dp(4), 0, dp(10), 0) })
+                          addView(names, LinearLayout.LayoutParams(0, -2, 1f))
+                          if (row.system) addView(TextView(this@MainActivity).apply {
+                              text = "SYS"; setTextColor(muted); textSize = 10f
+                          })
+                          setOnClickListener { toggle(row.pkg) }
+                      }
+                  }
+              }
+          }
+          RZX_EOF
+          mkdir -p "$(dirname 'app/src/main/java/com/rizzxy/store/NickAuto.kt')"
+          cat > 'app/src/main/java/com/rizzxy/store/NickAuto.kt' <<'RZX_EOF'
+          package com.rizzxy.store
+
+          import android.content.ClipData
+          import android.content.ClipboardManager
+          import android.content.Context
+          import android.util.DisplayMetrics
+          import android.view.WindowManager
+
+          /** Menjalankan alur tap nickname (RANDOM / REQUEST). Dipakai RunService (RUN 2) dan tombol TES. */
+          object NickAuto {
+              const val MODE_OFF = 0
+              const val MODE_RANDOM = 1
+              const val MODE_REQUEST = 2
+
+              fun nickFor(c: Context, no: Int): String = Cfg.nickText(c) + "%03d".format(no)
+
+              private fun setClip(c: Context, text: String) {
+                  try {
+                      val cm = c.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                      cm.setPrimaryClip(ClipData.newPlainText("nick", text))
+                  } catch (e: Exception) {
+                  }
+              }
+
+              /**
+               * @param sleep tidur ms, mengembalikan false kalau dihentikan
+               * @return false kalau dihentikan di tengah jalan, true kalau selesai (atau dilewati)
+               */
+              fun run(c: Context, mode: Int, no: Int, sleep: (Long) -> Boolean, log: (String) -> Unit): Boolean {
+                  if (mode == MODE_OFF) return true
+                  if (!AutoService.ready() && RootHelper.rooted != true) {
+                      log("NICK dilewati: Accessibility belum aktif")
+                      return true
+                  }
+                  val flow: String
+                  if (mode == MODE_REQUEST) {
+                      val nick = nickFor(c, no)
+                      setClip(c, nick)
+                      log("NICK $nick")
+                      flow = Cfg.nickFlow(c)
+                      if (!sleep(300L)) return false
+                  } else {
+                      log("NICK acak (ketuk)")
+                      flow = Cfg.nickRFlow(c)
+                  }
+                  if (!sleep(Cfg.nickPre(c) * 1000L)) return false
+
+                  val dm = DisplayMetrics()
+                  @Suppress("DEPRECATION")
+                  (c.getSystemService(Context.WINDOW_SERVICE) as WindowManager).defaultDisplay.getRealMetrics(dm)
+                  val gap = Cfg.nickGapMs(c).toLong()
+
+                  for (raw in flow.lines()) {
+                      val ln = raw.trim()
+                      if (ln.isEmpty() || ln.startsWith("#")) continue
+                      if (ln.startsWith("~")) {
+                          val sec = ln.substring(1).trim().toDoubleOrNull() ?: continue
+                          if (!sleep((sec * 1000).toLong())) return false
+                          continue
+                      }
+                      if (ln.startsWith("@") || ln.startsWith("!")) {
+                          val longPress = ln.startsWith("!")
+                          var body = ln.substring(1)
+                          var times = 1
+                          val star = body.indexOf('*')
+                          if (star >= 0) {
+                              times = body.substring(star + 1).trim().toIntOrNull() ?: 1
+                              body = body.substring(0, star)
+                          }
+                          val xy = body.split(",")
+                          if (xy.size < 2) continue
+                          val fx = xy[0].trim().toFloatOrNull() ?: continue
+                          val fy = xy[1].trim().toFloatOrNull() ?: continue
+                          val px = fx.coerceIn(0f, 1f) * dm.widthPixels
+                          val py = fy.coerceIn(0f, 1f) * dm.heightPixels
+                          val dur = if (longPress) 900L else 60L
+                          for (k in 0 until times.coerceIn(1, 200)) {
+                              if (!AutoService.tap(px, py, dur)) {
+                                  log("KETUK gagal")
+                                  return true
+                              }
+                              if (!sleep(dur + gap)) return false
+                          }
+                      }
+                  }
+                  if (!sleep(Cfg.nickAfter(c) * 1000L)) return false
+                  return true
+              }
+          }
+          RZX_EOF
+          mkdir -p "$(dirname 'app/src/main/java/com/rizzxy/store/PairReceiver.kt')"
+          cat > 'app/src/main/java/com/rizzxy/store/PairReceiver.kt' <<'RZX_EOF'
+          package com.rizzxy.store
+
+          import android.app.RemoteInput
+          import android.content.BroadcastReceiver
+          import android.content.Context
+          import android.content.Intent
+
+          /** Menerima kode pairing yang diketik dari notifikasi, lalu pairing + connect otomatis. */
+          class PairReceiver : BroadcastReceiver() {
+              override fun onReceive(context: Context, intent: Intent) {
+                  val code = RemoteInput.getResultsFromIntent(intent)
+                      ?.getCharSequence("code")?.toString()?.trim().orEmpty()
+                  val app = context.applicationContext
+                  if (code.length != 6) {
+                      AdbHelper.postStatus(app, "Kode harus 6 digit")
+                      return
+                  }
+                  val pending = goAsync()
+                  Thread {
+                      try {
+                          AdbHelper.pairAndConnect(app, code, "", 0, 0)
+                          AdbHelper.postStatus(app, "Pairing dan connect berhasil")
+                          AdbHelper.stopDiscovery()
+                      } catch (e: Throwable) {
+                          AdbHelper.log("✕ " + (e.message ?: e.javaClass.simpleName))
+                          AdbHelper.postStatus(app, "Gagal: " + (e.message ?: "lihat tab ADB"))
+                      } finally {
+                          pending.finish()
+                      }
+                  }.start()
+              }
+          }
+          RZX_EOF
+          mkdir -p "$(dirname 'app/src/main/java/com/rizzxy/store/PointPicker.kt')"
+          cat > 'app/src/main/java/com/rizzxy/store/PointPicker.kt' <<'RZX_EOF'
+          package com.rizzxy.store
+
+          import android.content.ClipData
+          import android.content.ClipboardManager
+          import android.content.Context
+          import android.graphics.Canvas
+          import android.graphics.Color
+          import android.graphics.Paint
+          import android.graphics.PixelFormat
+          import android.graphics.Typeface
+          import android.graphics.drawable.GradientDrawable
+          import android.provider.Settings
+          import android.util.DisplayMetrics
+          import android.view.Gravity
+          import android.view.MotionEvent
+          import android.view.View
+          import android.view.WindowManager
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.TextView
+          import android.widget.Toast
+
+          /**
+           * Pencari titik tap: sentuh layar, tiap titik jadi baris "@x,y" dan seluruh daftar disalin ke clipboard.
+           * Mode MAIN GAME meneruskan sentuhan ke game supaya bisa pindah layar, lalu balik ke mode PILIH.
+           */
+          object PointPicker {
+              private var wm: WindowManager? = null
+              private var capture: View? = null
+              private var captureLp: WindowManager.LayoutParams? = null
+              private var panel: View? = null
+              private val points = ArrayList<String>()
+
+              private class CaptureView(c: Context, val onPick: (Float, Float) -> Unit) : View(c) {
+                  var px = -1f
+                  var py = -1f
+                  private val ring = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                      color = Color.RED
+                      style = Paint.Style.STROKE
+                      strokeWidth = 4f
+                  }
+                  private val dot = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.YELLOW }
+
+                  override fun onTouchEvent(e: MotionEvent): Boolean {
+                      val a = e.actionMasked
+                      if (a == MotionEvent.ACTION_DOWN || a == MotionEvent.ACTION_MOVE || a == MotionEvent.ACTION_UP) {
+                          px = e.rawX
+                          py = e.rawY
+                          invalidate()
+                          if (a == MotionEvent.ACTION_UP) onPick(e.rawX, e.rawY)
+                      }
+                      return true
+                  }
+
+                  override fun onDraw(canvas: Canvas) {
+                      if (px < 0f) return
+                      val loc = IntArray(2)
+                      getLocationOnScreen(loc)
+                      val x = px - loc[0]
+                      val y = py - loc[1]
+                      canvas.drawCircle(x, y, 40f, ring)
+                      canvas.drawCircle(x, y, 6f, dot)
+                  }
+              }
+
+              private fun metrics(w: WindowManager): DisplayMetrics {
+                  val dm = DisplayMetrics()
+                  @Suppress("DEPRECATION")
+                  w.defaultDisplay.getRealMetrics(dm)
+                  return dm
+              }
+
+              private fun copy(c: Context) {
+                  try {
+                      val cm = c.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                      cm.setPrimaryClip(ClipData.newPlainText("titik", points.joinToString("\n")))
+                  } catch (e: Exception) {
+                  }
+              }
+
+              fun show(ctx: Context) {
+                  if (capture != null) return
+                  val app = ctx.applicationContext
+                  if (!Settings.canDrawOverlays(app)) {
+                      Toast.makeText(app, "Aktifkan izin overlay dulu", Toast.LENGTH_SHORT).show()
+                      return
+                  }
+                  val w = app.getSystemService(Context.WINDOW_SERVICE) as WindowManager
+                  val density = app.resources.displayMetrics.density
+                  points.clear()
+
+                  val label = TextView(app)
+                  label.text = "Sentuh layar untuk menandai titik"
+                  label.setTextColor(0xFFFFFFFF.toInt())
+                  label.textSize = 11f
+                  label.typeface = Typeface.DEFAULT_BOLD
+
+                  val cap = CaptureView(app) { rx, ry ->
+                      val m = metrics(w)
+                      val fx = Math.round(rx / m.widthPixels * 1000f) / 1000f
+                      val fy = Math.round(ry / m.heightPixels * 1000f) / 1000f
+                      points.add("@$fx,$fy")
+                      copy(app)
+                      label.text = "titik ${points.size}: x=$fx y=$fy (daftar sudah disalin)"
+                  }
+                  cap.setBackgroundColor(0x33000000)
+
+                  val capLp = WindowManager.LayoutParams(
+                      WindowManager.LayoutParams.MATCH_PARENT,
+                      WindowManager.LayoutParams.MATCH_PARENT,
+                      WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                          WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                          WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                      PixelFormat.TRANSLUCENT
+                  )
+                  capLp.gravity = Gravity.TOP or Gravity.START
+
+                  val box = LinearLayout(app)
+                  box.orientation = LinearLayout.VERTICAL
+                  val pad = (8 * density).toInt()
+                  box.setPadding(pad, pad, pad, pad)
+                  val bgDraw = GradientDrawable()
+                  bgDraw.cornerRadius = 10 * density
+                  bgDraw.setColor(0xE6081018.toInt())
+                  bgDraw.setStroke((1 * density).toInt(), 0xFFA855F7.toInt())
+                  box.background = bgDraw
+                  box.addView(label)
+
+                  val row = LinearLayout(app)
+                  row.orientation = LinearLayout.HORIZONTAL
+                  val modeBtn = Button(app)
+                  modeBtn.text = "MODE: PILIH"
+                  modeBtn.textSize = 10f
+                  modeBtn.setOnClickListener {
+                      val lp = captureLp ?: return@setOnClickListener
+                      val picking = (lp.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE) == 0
+                      lp.flags = if (picking) {
+                          lp.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                      } else {
+                          lp.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
+                      }
+                      try {
+                          wm?.updateViewLayout(capture, lp)
+                      } catch (e: Exception) {
+                      }
+                      modeBtn.text = if (picking) "MODE: MAIN GAME" else "MODE: PILIH"
+                  }
+                  val clearBtn = Button(app)
+                  clearBtn.text = "HAPUS"
+                  clearBtn.textSize = 10f
+                  clearBtn.setOnClickListener {
+                      points.clear()
+                      label.text = "daftar titik dikosongkan"
+                  }
+                  val closeBtn = Button(app)
+                  closeBtn.text = "TUTUP"
+                  closeBtn.textSize = 10f
+                  closeBtn.setOnClickListener {
+                      val n = points.size
+                      hide()
+                      Toast.makeText(app, "$n titik disalin. Tempel di EDIT ALUR TAP", Toast.LENGTH_LONG).show()
+                  }
+                  row.addView(modeBtn)
+                  row.addView(clearBtn)
+                  row.addView(closeBtn)
+                  box.addView(row)
+
+                  val panelLp = WindowManager.LayoutParams(
+                      WindowManager.LayoutParams.WRAP_CONTENT,
+                      WindowManager.LayoutParams.WRAP_CONTENT,
+                      WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                      PixelFormat.TRANSLUCENT
+                  )
+                  panelLp.gravity = Gravity.TOP or Gravity.START
+                  panelLp.x = (8 * density).toInt()
+                  panelLp.y = (8 * density).toInt()
+
+                  try {
+                      w.addView(cap, capLp)
+                      w.addView(box, panelLp)
+                      wm = w
+                      capture = cap
+                      captureLp = capLp
+                      panel = box
+                  } catch (e: Exception) {
+                      try {
+                          w.removeView(cap)
+                      } catch (e2: Exception) {
+                      }
+                      Toast.makeText(app, "Gagal menampilkan overlay", Toast.LENGTH_SHORT).show()
+                  }
+              }
+
+              fun hide() {
+                  try {
+                      capture?.let { wm?.removeView(it) }
+                  } catch (e: Exception) {
+                  }
+                  try {
+                      panel?.let { wm?.removeView(it) }
+                  } catch (e: Exception) {
+                  }
+                  capture = null
+                  captureLp = null
+                  panel = null
+              }
+          }
+          RZX_EOF
+          mkdir -p "$(dirname 'app/src/main/java/com/rizzxy/store/RootHelper.kt')"
+          cat > 'app/src/main/java/com/rizzxy/store/RootHelper.kt' <<'RZX_EOF'
+          package com.rizzxy.store
+
+          import java.util.concurrent.TimeUnit
+
+          /**
+           * Akses ROOT langsung (tanpa ADB): jalankan perintah shell lewat `su`.
+           * Dipakai untuk set Device Owner dan hapus data aplikasi (pm clear).
+           */
+          object RootHelper {
+
+              /** null = belum dicek, true = root tersedia, false = tidak ada / ditolak. */
+              @Volatile
+              var rooted: Boolean? = null
+                  private set
+
+              private val pkgRe = Regex("^[A-Za-z0-9._]+$")
+
+              /** Jalankan satu perintah sebagai root. Kembalikan output gabungan (stdout+stderr). */
+              fun run(cmd: String, timeoutSec: Long = 30): String {
+                  val p = try {
+                      ProcessBuilder("su", "-c", cmd).redirectErrorStream(true).start()
+                  } catch (e: Exception) {
+                      rooted = false
+                      throw IllegalStateException("Perintah su tidak ditemukan (HP belum root)")
+                  }
+                  var out = ""
+                  val reader = Thread { out = p.inputStream.bufferedReader().readText() }
+                  reader.start()
+                  if (!p.waitFor(timeoutSec, TimeUnit.SECONDS)) {
+                      p.destroyForcibly()
+                      throw IllegalStateException("Perintah root timeout (cek izin root di Magisk/KernelSU)")
+                  }
+                  reader.join(2000)
+                  return out
+              }
+
+              /** Cek apakah izin root diberikan (akan memunculkan dialog Magisk/KernelSU). */
+              fun check(): Boolean {
+                  val ok = try {
+                      run("id", 20).contains("uid=0")
+                  } catch (e: IllegalStateException) {
+                      rooted = false
+                      throw e
+                  }
+                  rooted = ok
+                  return ok
+              }
+
+              /** Hapus data satu aplikasi (setara "Clear data"). */
+              fun clearData(pkg: String): Boolean {
+                  if (!pkgRe.matches(pkg)) return false
+                  return run("pm clear $pkg", 30).contains("Success", true)
+              }
+
+              fun setDeviceOwner(pkg: String): String =
+                  run("dpm set-device-owner $pkg/.AdminReceiver", 30).trim()
+          }
+          RZX_EOF
+          mkdir -p "$(dirname 'app/src/main/java/com/rizzxy/store/RunService.kt')"
+          cat > 'app/src/main/java/com/rizzxy/store/RunService.kt' <<'RZX_EOF'
+          package com.rizzxy.store
+
+          import android.app.ActivityManager
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.Service
+          import android.content.ComponentName
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.graphics.PixelFormat
+          import android.graphics.Typeface
+          import android.graphics.drawable.GradientDrawable
+          import android.os.Build
+          import android.os.Handler
+          import android.os.IBinder
+          import android.os.Looper
+          import android.provider.Settings
+          import android.view.Gravity
+          import android.view.View
+          import android.view.WindowManager
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.ProgressBar
+          import android.widget.TextView
+
+          /** Membuka server satu per satu dalam 1 proses: buka -> tunggu -> nick -> apk berikutnya. Ada PAUSE/PLAY dan STOP. */
+          class RunService : Service() {
+
+              companion object {
+                  const val EXTRA_PKGS = "pkgs"
+                  const val EXTRA_ACT = "act"
+                  const val EXTRA_D1 = "d1"
+                  const val EXTRA_D2 = "d2"
+                  const val EXTRA_CLOSE_END = "closeEnd"
+
+                  @Volatile
+                  var running = false
+              }
+
+              private val ui = Handler(Looper.getMainLooper())
+
+              @Volatile
+              private var stopFlag = false
+
+              @Volatile
+              private var paused = false
+              private var wm: WindowManager? = null
+              private var panel: View? = null
+              private var panelLp: WindowManager.LayoutParams? = null
+              private var titleTv: TextView? = null
+              private var bar: ProgressBar? = null
+              private var logTv: TextView? = null
+              private val lines = ArrayList<String>()
+
+              override fun onBind(intent: Intent?): IBinder? = null
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  startFg()
+                  if (running) return START_NOT_STICKY
+                  val pkgs = intent?.getStringArrayListExtra(EXTRA_PKGS) ?: arrayListOf()
+                  if (intent == null || pkgs.isEmpty()) {
+                      stopSelf()
+                      return START_NOT_STICKY
+                  }
+                  val act = intent.getStringExtra(EXTRA_ACT) ?: Cfg.DEF_ACT
+                  val d1 = intent.getIntExtra(EXTRA_D1, 15)
+                  val d2 = intent.getIntExtra(EXTRA_D2, 16)
+                  val closeEnd = intent.getBooleanExtra(EXTRA_CLOSE_END, false)
+                  running = true
+                  stopFlag = false
+                  paused = false
+                  showOverlay()
+                  Thread { runAll(pkgs, act, d1, d2, closeEnd) }.start()
+                  return START_NOT_STICKY
+              }
+
+              private fun startFg() {
+                  val nm = getSystemService(NotificationManager::class.java)
+                  nm.createNotificationChannel(NotificationChannel("run", "Run", NotificationManager.IMPORTANCE_LOW))
+                  val n = Notification.Builder(this, "run")
+                      .setContentTitle("Rizzxy Store")
+                      .setContentText("Membuka server bergantian")
+                      .setSmallIcon(android.R.drawable.ic_media_play)
+                      .build()
+                  if (Build.VERSION.SDK_INT >= 34) {
+                      startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+                  } else {
+                      startForeground(1, n)
+                  }
+              }
+
+              private fun runAll(pkgs: List<String>, act: String, d1: Int, d2: Int, closeEnd: Boolean) {
+                  // 1 proses saja: buka -> tunggu -> (nick di kunjungan yang sama) -> apk berikutnya.
+                  // Setelah apk terakhir selesai cukup Home sekali, tidak ada putaran kedua.
+                  val total = pkgs.size
+                  val nickMode = Cfg.nickMode(this)
+                  var nickNo = Cfg.nickStart(this)
+                  var step = 0
+                  loop@ for (p in pkgs) {
+                      if (!waitIfPaused()) break@loop
+                      step++
+                      setTitle("[RUN] ${step}/${total}", step * 100 / total)
+                      log("OPEN $p (${d1}s)")
+                      if (!open(p, act)) {
+                          log("SKIP $p (tidak ada activity)")
+                          continue
+                      }
+                      if (!sleepMs(d1 * 1000L)) break@loop
+                      if (nickMode != NickAuto.MODE_OFF) {
+                          setPanelTouchable(false)
+                          val ok = NickAuto.run(this, nickMode, nickNo, { ms -> sleepMs(ms) }, { m -> log(m) })
+                          setPanelTouchable(true)
+                          if (!ok) break@loop
+                          nickNo++
+                      }
+                  }
+                  if (!stopFlag) {
+                      goHome()
+                      sleepMs(500L)
+                  }
+                  if (!stopFlag && closeEnd) {
+                      pkgs.forEach { kill(it) }
+                      log("CLOSE ${pkgs.size} server")
+                  }
+                  log(if (stopFlag) "STOPPED" else "DONE")
+                  ui.postDelayed({ stopSelf() }, 2500)
+              }
+
+              /** Panel overlay tidak boleh menangkap ketukan otomatis di area yang sama. */
+              private fun setPanelTouchable(on: Boolean) {
+                  ui.post {
+                      try {
+                          val p = panel ?: return@post
+                          val lp = panelLp ?: return@post
+                          lp.flags = if (on) {
+                              lp.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
+                          } else {
+                              lp.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                          }
+                          wm?.updateViewLayout(p, lp)
+                      } catch (e: Exception) {
+                      }
+                  }
+              }
+
+              private fun open(pkg: String, act: String): Boolean {
+                  return try {
+                      val i = Intent().setComponent(ComponentName(pkg, act)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                      if (packageManager.resolveActivity(i, 0) == null) {
+                          false
+                      } else {
+                          startActivity(i)
+                          true
+                      }
+                  } catch (e: Exception) {
+                      false
+                  }
+              }
+
+              private fun goHome() {
+                  if (AutoService.home()) return
+                  try {
+                      val h = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                      startActivity(h)
+                  } catch (e: Exception) {
+                  }
+              }
+
+              private fun kill(pkg: String) {
+                  try {
+                      getSystemService(ActivityManager::class.java).killBackgroundProcesses(pkg)
+                  } catch (e: Exception) {
+                  }
+              }
+
+              private fun sleepMs(ms: Long): Boolean {
+                  var left = ms
+                  while (left > 0) {
+                      if (stopFlag) return false
+                      if (paused) {
+                          Thread.sleep(100L)
+                          continue
+                      }
+                      val s = if (left > 100L) 100L else left
+                      Thread.sleep(s)
+                      left -= s
+                  }
+                  return !stopFlag
+              }
+
+              /** Tahan alur selama PAUSE; false kalau dihentikan. */
+              private fun waitIfPaused(): Boolean {
+                  while (paused && !stopFlag) Thread.sleep(100L)
+                  return !stopFlag
+              }
+
+              private fun setTitle(t: String, progress: Int) {
+                  ui.post {
+                      titleTv?.text = if (paused) "[PAUSE] $t" else t
+                      bar?.progress = progress
+                  }
+              }
+
+              private fun log(s: String) {
+                  ui.post {
+                      lines.add(s)
+                      while (lines.size > 6) lines.removeAt(0)
+                      logTv?.text = lines.joinToString("\n")
+                  }
+              }
+
+              private fun showOverlay() {
+                  if (!Settings.canDrawOverlays(this)) return
+                  val density = resources.displayMetrics.density
+                  fun dp(v: Int) = (v * density).toInt()
+
+                  val box = LinearLayout(this)
+                  box.orientation = LinearLayout.VERTICAL
+                  box.setPadding(dp(10), dp(8), dp(10), dp(8))
+                  val bgDraw = GradientDrawable()
+                  bgDraw.cornerRadius = dp(12).toFloat()
+                  bgDraw.setColor(0xE6081018.toInt())
+                  bgDraw.setStroke(dp(1), 0xFFA855F7.toInt())
+                  box.background = bgDraw
+
+                  val t = TextView(this)
+                  t.text = "[RUN] SIAP"
+                  t.setTextColor(0xFFA855F7.toInt())
+                  t.textSize = 11f
+                  t.typeface = Typeface.DEFAULT_BOLD
+
+                  val b = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal)
+                  b.max = 100
+
+                  val l = TextView(this)
+                  l.setTextColor(0xFFDDD6FE.toInt())
+                  l.textSize = 9f
+                  l.typeface = Typeface.MONOSPACE
+
+                  val play = Button(this)
+                  play.text = "⏸ PAUSE"
+                  play.textSize = 10f
+                  play.setOnClickListener {
+                      paused = !paused
+                      play.text = if (paused) "▶ PLAY" else "⏸ PAUSE"
+                      titleTv?.let { tv ->
+                          val base = tv.text.toString().removePrefix("[PAUSE] ")
+                          tv.text = if (paused) "[PAUSE] $base" else base
+                      }
+                  }
+
+                  val stop = Button(this)
+                  stop.text = "■ STOP"
+                  stop.textSize = 10f
+                  stop.setOnClickListener {
+                      stopFlag = true
+                      paused = false
+                      stopSelf()
+                  }
+
+                  val btnRow = LinearLayout(this)
+                  btnRow.orientation = LinearLayout.HORIZONTAL
+                  btnRow.addView(play, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+                  btnRow.addView(stop, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+
+                  box.addView(t)
+                  box.addView(b)
+                  box.addView(l)
+                  box.addView(btnRow)
+                  titleTv = t
+                  bar = b
+                  logTv = l
+
+                  val lp = WindowManager.LayoutParams(
+                      dp(230),
+                      WindowManager.LayoutParams.WRAP_CONTENT,
+                      WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                      PixelFormat.TRANSLUCENT
+                  )
+                  lp.gravity = Gravity.TOP or Gravity.END
+                  lp.x = dp(8)
+                  lp.y = dp(48)
+                  try {
+                      val w = getSystemService(WINDOW_SERVICE) as WindowManager
+                      w.addView(box, lp)
+                      wm = w
+                      panel = box
+                      panelLp = lp
+                  } catch (e: Exception) {
+                  }
+              }
+
+              override fun onDestroy() {
+                  stopFlag = true
+                  running = false
+                  try {
+                      val p = panel
+                      if (p != null) wm?.removeView(p)
+                  } catch (e: Exception) {
+                  }
+                  panel = null
+                  super.onDestroy()
+              }
+          }
+          RZX_EOF
+          mkdir -p "$(dirname 'app/src/main/java/com/rizzxy/store/Theme.kt')"
+          cat > 'app/src/main/java/com/rizzxy/store/Theme.kt' <<'RZX_EOF'
+          package com.rizzxy.store
+
+          import android.content.Context
+          import android.graphics.Bitmap
+          import android.graphics.BitmapFactory
+          import android.graphics.Color
+          import android.net.Uri
+          import java.io.File
+
+          /**
+           * Tema custom: warna (geser hue dari palet dasar ungu) + wallpaper background.
+           * Semua warna UI dasarnya ungu; t() menggeser hue-nya sesuai tema yang dipilih.
+           */
+          object Theme {
+              const val BASE_HUE = 271f
+
+              /** nama preset -> hue */
+              val presets = listOf(
+                  "UNGU" to 271f, "BIRU" to 217f, "TOSCA" to 180f, "HIJAU" to 145f,
+                  "KUNING" to 45f, "ORANYE" to 25f, "MERAH" to 350f, "PINK" to 320f
+              )
+
+              @Volatile var hue = BASE_HUE
+                  private set
+              /** 0 ringan, 1 sedang, 2 gelap */
+              @Volatile var dim = 1
+                  private set
+              @Volatile var wallpaper: Bitmap? = null
+                  private set
+
+              /** true kalau wallpaper berupa video (file wallpaper.mp4 ada). */
+              @Volatile var hasVideo = false
+                  private set
+              /** suara video: default mute */
+              @Volatile var muted = true
+                  private set
+
+              val hasWall: Boolean get() = wallpaper != null || hasVideo
+
+              fun videoFile(c: Context): File = File(c.filesDir, "wallpaper.mp4")
+
+              private fun sp(c: Context) = c.getSharedPreferences("theme", Context.MODE_PRIVATE)
+              private fun wallFile(c: Context) = File(c.filesDir, "wallpaper.jpg")
+
+              fun load(c: Context) {
+                  hue = sp(c).getFloat("hue", BASE_HUE)
+                  dim = sp(c).getInt("dim", 1)
+                  muted = sp(c).getBoolean("muted", true)
+                  hasVideo = videoFile(c).exists()
+                  wallpaper = if (hasVideo) null else try {
+                      val f = wallFile(c)
+                      if (f.exists()) BitmapFactory.decodeFile(f.absolutePath) else null
+                  } catch (e: Throwable) {
+                      null
+                  }
+              }
+
+              fun setMuted(c: Context, m: Boolean) {
+                  muted = m
+                  sp(c).edit().putBoolean("muted", m).apply()
+              }
+
+              /** Salin video pilihan jadi wallpaper (maks 150 MB). Panggil dari thread background. */
+              fun saveVideo(c: Context, uri: Uri): Boolean {
+                  val tmp = File(c.filesDir, "wallpaper.tmp")
+                  return try {
+                      var total = 0L
+                      val limit = 150L * 1024 * 1024
+                      c.contentResolver.openInputStream(uri)?.use { ins ->
+                          tmp.outputStream().use { out ->
+                              val buf = ByteArray(64 * 1024)
+                              while (true) {
+                                  val n = ins.read(buf)
+                                  if (n < 0) break
+                                  total += n
+                                  if (total > limit) throw IllegalStateException("terlalu besar")
+                                  out.write(buf, 0, n)
+                              }
+                          }
+                      } ?: return false
+                      val dst = videoFile(c)
+                      dst.delete()
+                      if (!tmp.renameTo(dst)) return false
+                      try { wallFile(c).delete() } catch (_: Exception) {}
+                      wallpaper = null
+                      hasVideo = true
+                      true
+                  } catch (e: Throwable) {
+                      try { tmp.delete() } catch (_: Exception) {}
+                      false
+                  }
+              }
+
+              fun setHue(c: Context, h: Float) {
+                  hue = ((h % 360f) + 360f) % 360f
+                  sp(c).edit().putFloat("hue", hue).apply()
+              }
+
+              fun setDim(c: Context, d: Int) {
+                  dim = d.coerceIn(0, 2)
+                  sp(c).edit().putInt("dim", dim).apply()
+              }
+
+              /** Hue dari kode warna (#RRGGBB) buatan pengguna; null kalau tidak valid. */
+              fun hueOf(hex: String): Float? {
+                  return try {
+                      val col = Color.parseColor(if (hex.startsWith("#")) hex else "#$hex")
+                      val hsv = FloatArray(3)
+                      Color.colorToHSV(col, hsv)
+                      hsv[0]
+                  } catch (e: Exception) {
+                      null
+                  }
+              }
+
+              /** Geser hue warna dasar (ungu) ke hue tema. */
+              fun t(base: Int): Int {
+                  val delta = hue - BASE_HUE
+                  if (Math.abs(delta) < 0.5f) return base
+                  val hsv = FloatArray(3)
+                  Color.colorToHSV(base, hsv)
+                  hsv[0] = ((hsv[0] + delta) % 360f + 360f) % 360f
+                  return Color.HSVToColor(Color.alpha(base), hsv)
+              }
+
+              /** Warna permukaan (kartu/panel): sedikit transparan kalau ada wallpaper. */
+              fun s(base: Int): Int {
+                  val c = t(base)
+                  return if (hasWall) Color.argb(0xB8, Color.red(c), Color.green(c), Color.blue(c)) else c
+              }
+
+              /** Lapisan gelap di atas wallpaper supaya teks tetap terbaca. */
+              fun dimColor(): Int = when (dim) {
+                  0 -> 0x40000000
+                  2 -> 0xA0000000.toInt()
+                  else -> 0x70000000
+              }
+
+              /** Simpan gambar pilihan (diperkecil) sebagai wallpaper. Panggil dari thread background. */
+              fun saveWallpaper(c: Context, uri: Uri): Boolean {
+                  return try {
+                      val opt = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                      c.contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, opt) }
+                      var sample = 1
+                      while (opt.outWidth / sample > 1600 || opt.outHeight / sample > 1600) sample *= 2
+                      val o2 = BitmapFactory.Options().apply { inSampleSize = sample }
+                      val bmp = c.contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, o2) }
+                          ?: return false
+                      wallFile(c).outputStream().use { bmp.compress(Bitmap.CompressFormat.JPEG, 88, it) }
+                      try { videoFile(c).delete() } catch (_: Exception) {}
+                      hasVideo = false
+                      wallpaper = bmp
+                      true
+                  } catch (e: Throwable) {
+                      false
+                  }
+              }
+
+              fun clearWallpaper(c: Context) {
+                  try { wallFile(c).delete() } catch (_: Exception) {}
+                  try { videoFile(c).delete() } catch (_: Exception) {}
+                  hasVideo = false
+                  wallpaper = null
+              }
+          }
+          RZX_EOF
+          mkdir -p "$(dirname 'app/src/main/java/com/rizzxy/store/VideoBg.kt')"
+          cat > 'app/src/main/java/com/rizzxy/store/VideoBg.kt' <<'RZX_EOF'
+          package com.rizzxy.store
+
+          import android.content.Context
+          import android.graphics.Matrix
+          import android.graphics.SurfaceTexture
+          import android.media.AudioAttributes
+          import android.media.MediaPlayer
+          import android.view.Surface
+          import android.view.TextureView
+          import java.io.File
+
+          /** Wallpaper video: diputar berulang, memenuhi layar (center-crop), suara bisa mute / unmute. */
+          class VideoBg(ctx: Context, private val file: File, muted: Boolean) :
+              TextureView(ctx), TextureView.SurfaceTextureListener {
+
+              private var mp: MediaPlayer? = null
+              private var surface: Surface? = null
+              private var vw = 0
+              private var vh = 0
+              private var ready = false
+
+              var isMuted: Boolean = muted
+                  set(v) {
+                      field = v
+                      applyVolume()
+                  }
+
+              init {
+                  surfaceTextureListener = this
+              }
+
+              private fun applyVolume() {
+                  val x = if (isMuted) 0f else 1f
+                  try { mp?.setVolume(x, x) } catch (_: Exception) {}
+              }
+
+              private fun begin(st: SurfaceTexture) {
+                  release()
+                  try {
+                      val s = Surface(st)
+                      surface = s
+                      val m = MediaPlayer()
+                      mp = m
+                      m.setSurface(s)
+                      m.setAudioAttributes(
+                          AudioAttributes.Builder()
+                              .setUsage(AudioAttributes.USAGE_MEDIA)
+                              .setContentType(AudioAttributes.CONTENT_TYPE_MOVIE)
+                              .build()
+                      )
+                      m.setDataSource(file.absolutePath)
+                      m.isLooping = true
+                      m.setOnVideoSizeChangedListener { _, w, h ->
+                          vw = w; vh = h
+                          fit()
+                      }
+                      m.setOnPreparedListener { p ->
+                          ready = true
+                          applyVolume()
+                          try { p.start() } catch (_: Exception) {}
+                      }
+                      m.setOnErrorListener { _, _, _ -> true }
+                      m.prepareAsync()
+                  } catch (e: Exception) {
+                      release()
+                  }
+              }
+
+              /** Skala supaya video menutup seluruh view tanpa terdistorsi. */
+              private fun fit() {
+                  val w = width.toFloat()
+                  val h = height.toFloat()
+                  if (vw <= 0 || vh <= 0 || w <= 0f || h <= 0f) return
+                  val scale = Math.max(w / vw, h / vh)
+                  val m = Matrix()
+                  m.setScale(vw * scale / w, vh * scale / h, w / 2f, h / 2f)
+                  setTransform(m)
+              }
+
+              fun pausePlayback() {
+                  try { if (ready) mp?.pause() } catch (_: Exception) {}
+              }
+
+              fun resumePlayback() {
+                  try { if (ready) mp?.start() } catch (_: Exception) {}
+              }
+
+              fun release() {
+                  ready = false
+                  try { mp?.release() } catch (_: Exception) {}
+                  mp = null
+                  try { surface?.release() } catch (_: Exception) {}
+                  surface = null
+              }
+
+              override fun onSurfaceTextureAvailable(st: SurfaceTexture, w: Int, h: Int) = begin(st)
+
+              override fun onSurfaceTextureSizeChanged(st: SurfaceTexture, w: Int, h: Int) = fit()
+
+              override fun onSurfaceTextureDestroyed(st: SurfaceTexture): Boolean {
+                  release()
+                  return true
+              }
+
+              override fun onSurfaceTextureUpdated(st: SurfaceTexture) {}
+          }
+          RZX_EOF
+          mkdir -p "$(dirname 'app/src/main/res/drawable/ic_vol_off.xml')"
+          cat > 'app/src/main/res/drawable/ic_vol_off.xml' <<'RZX_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="24dp"
+              android:height="24dp"
+              android:viewportWidth="24"
+              android:viewportHeight="24">
+              <path
+                  android:fillColor="#FFFFFFFF"
+                  android:pathData="M16.5,12c0,-1.77 -1.02,-3.29 -2.5,-4.03v2.21l2.45,2.45c0.03,-0.2 0.05,-0.41 0.05,-0.63z M19,12c0,0.94 -0.2,1.82 -0.54,2.64l1.51,1.51C20.63,14.91 21,13.5 21,12c0,-4.28 -2.99,-7.86 -7,-8.77v2.06c2.89,0.86 5,3.54 5,6.71z M4.27,3L3,4.27 7.73,9H3v6h4l5,5v-6.73l4.25,4.25c-0.67,0.52 -1.42,0.93 -2.25,1.18v2.06c1.38,-0.31 2.63,-0.95 3.69,-1.81L19.73,21 21,19.73l-9,-9L4.27,3z M12,4L9.91,6.09 12,8.18V4z" />
+          </vector>
+          RZX_EOF
+          mkdir -p "$(dirname 'app/src/main/res/drawable/ic_vol_on.xml')"
+          cat > 'app/src/main/res/drawable/ic_vol_on.xml' <<'RZX_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="24dp"
+              android:height="24dp"
+              android:viewportWidth="24"
+              android:viewportHeight="24">
+              <path
+                  android:fillColor="#FFFFFFFF"
+                  android:pathData="M3,9v6h4l5,5V4L7,9H3z M16.5,12c0,-1.77 -1.02,-3.29 -2.5,-4.03v8.05c1.48,-0.73 2.5,-2.25 2.5,-4.02z M14,3.23v2.06c2.89,0.86 5,3.54 5,6.71s-2.11,5.85 -5,6.71v2.06c4.01,-0.91 7,-4.49 7,-8.77s-2.99,-7.86 -7,-8.77z" />
+          </vector>
+          RZX_EOF
+          mkdir -p "$(dirname 'app/src/main/res/values/strings.xml')"
+          cat > 'app/src/main/res/values/strings.xml' <<'RZX_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="acc_desc">Dipakai Rizzxy Store untuk menekan tombol Home otomatis di sela urutan buka server, dan untuk mengetuk titik layar pada fitur Nickname otomatis (RUN 2). Tidak membaca layar atau data apa pun.</string>
+          </resources>
+          RZX_EOF
+          mkdir -p "$(dirname 'app/src/main/res/values/styles.xml')"
+          cat > 'app/src/main/res/values/styles.xml' <<'RZX_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <style name="AppTheme" parent="android:Theme.Material.NoActionBar">
+                  <item name="android:colorAccent">#A855F7</item>
+                  <item name="android:colorPrimary">#1A1030</item>
+                  <item name="android:colorPrimaryDark">#0B0714</item>
+                  <item name="android:colorControlActivated">#A855F7</item>
+                  <item name="android:windowBackground">@android:color/black</item>
+                  <item name="android:statusBarColor">#0B0714</item>
+                  <item name="android:navigationBarColor">#0B0714</item>
+                  <item name="android:textColorHint">#7C6FA3</item>
+              </style>
+          </resources>
+          RZX_EOF
+          mkdir -p "$(dirname 'app/src/main/res/xml/accessibility_service.xml')"
+          cat > 'app/src/main/res/xml/accessibility_service.xml' <<'RZX_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeWindowStateChanged"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:notificationTimeout="200"
+              android:canRetrieveWindowContent="false"
+              android:accessibilityFlags="flagDefault"
+              android:canPerformGestures="true"
+              android:description="@string/acc_desc" />
+          RZX_EOF
+          mkdir -p "$(dirname 'app/src/main/res/xml/device_admin.xml')"
+          cat > 'app/src/main/res/xml/device_admin.xml' <<'RZX_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <device-admin xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-policies />
+          </device-admin>
+          RZX_EOF
+          mkdir -p "$(dirname 'build.gradle.kts')"
+          cat > 'build.gradle.kts' <<'RZX_EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          RZX_EOF
+          mkdir -p "$(dirname 'gradle.properties')"
+          cat > 'gradle.properties' <<'RZX_EOF'
+          org.gradle.jvmargs=-Xmx2048m
+          android.nonTransitiveRClass=true
+          android.useAndroidX=true
+          RZX_EOF
+          mkdir -p "$(dirname 'settings.gradle.kts')"
+          cat > 'settings.gradle.kts' <<'RZX_EOF'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+                  maven { url = uri("https://jitpack.io") }
+              }
+          }
+          rootProject.name = "RizzxyStore"
+          include(":app")
+          RZX_EOF
+          # ikon launcher
+          cat > icon.b64 <<'RZX_EOF'
+          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
+          RZX_EOF
+          base64 -d icon.b64 > icon.webp
+          for n in mdpi hdpi xhdpi xxhdpi xxxhdpi; do
+            mkdir -p app/src/main/res/mipmap-$n
+            cp icon.webp app/src/main/res/mipmap-$n/ic_launcher.webp
+          done
+          rm icon.b64 icon.webp
+      - name: Build
+        working-directory: project
+        run: gradle assembleDebug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RizzxyStore-apk
+          path: project/app/build/outputs/apk/debug/app-debug.apk
